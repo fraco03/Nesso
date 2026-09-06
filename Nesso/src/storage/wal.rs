@@ -1,0 +1,273 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use super::record::{Record, HEADER_SIZE, MAGIC_BYTE};
+
+pub const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
+const MAX_LRU_CACHE_SIZE: usize = 8;
+
+#[inline]
+fn extract_payload_len(header: &[u8]) -> usize {
+    u32::from_be_bytes(header[15..19].try_into().unwrap()) as usize
+}
+
+pub struct WalReader {
+    dir: PathBuf,
+    read_cache: Mutex<Vec<(u64, File)>>,
+}
+
+impl WalReader {
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            read_cache: Mutex::new(Vec::with_capacity(MAX_LRU_CACHE_SIZE)),
+        }
+    }
+
+    pub fn read_at(&self, segment_id: u64, offset: u64) -> io::Result<Option<Record>> {
+        let mut cache = self.read_cache.lock().unwrap();
+
+        let file_idx = cache.iter().position(|(id, _)| *id == segment_id);
+        let file = if let Some(idx) = file_idx {
+            let entry = cache.remove(idx);
+            cache.push(entry);
+            &mut cache.last_mut().unwrap().1
+        } else {
+            let path = self.dir.join(format!("nesso.{:05}.wal", segment_id));
+            let f = File::open(&path)?;
+            if cache.len() >= MAX_LRU_CACHE_SIZE {
+                cache.remove(0);
+            }
+            cache.push((segment_id, f));
+            &mut cache.last_mut().unwrap().1
+        };
+
+        file.seek(SeekFrom::Start(offset))?;
+
+        let mut header = vec![0u8; HEADER_SIZE];
+        if let Err(e) = file.read_exact(&mut header) {
+            if e.kind() == io::ErrorKind::UnexpectedEof { return Ok(None); }
+            return Err(e);
+        }
+
+        if header[0] != MAGIC_BYTE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Corrupted magic byte"));
+        }
+
+        let payload_len = extract_payload_len(&header);
+        let mut payload = vec![0u8; payload_len];
+
+        if let Err(e) = file.read_exact(&mut payload) {
+            if e.kind() == io::ErrorKind::UnexpectedEof { return Ok(None); }
+            return Err(e);
+        }
+
+        let mut full_record = Vec::with_capacity(HEADER_SIZE + payload_len);
+        full_record.extend_from_slice(&header);
+        full_record.extend_from_slice(&payload);
+
+        Ok(Record::decode(&full_record))
+    }
+}
+
+pub struct Wal {
+    dir: PathBuf,
+    active_segment_id: u64,
+    active_file: File,
+    current_size: u64,
+    max_segment_size: u64,
+}
+
+impl Wal {
+    pub fn open(dir: impl AsRef<Path>, max_segment_size: Option<u64>) -> io::Result<Self> {
+        let dir = dir.as_ref();
+        
+        if !dir.exists() {
+            fs::create_dir_all(dir)?;
+        }
+
+        let mut max_id = 0;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(id_str) = name.strip_prefix("nesso.").and_then(|s| s.strip_suffix(".wal")) {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            if id > max_id { max_id = id; }
+                        }
+                    }
+                }
+            }
+        }
+
+        if max_id == 0 { max_id = 1; }
+
+        let active_path = dir.join(format!("nesso.{:05}.wal", max_id));
+        let mut active_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&active_path)?;
+
+        let current_size = active_file.seek(SeekFrom::End(0))?;
+
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            active_segment_id: max_id,
+            active_file,
+            current_size,
+            max_segment_size: max_segment_size.unwrap_or(DEFAULT_MAX_SEGMENT_SIZE),
+        })
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        self.active_file.sync_data()?;
+        self.active_segment_id += 1;
+        
+        let active_path = self.dir.join(format!("nesso.{:05}.wal", self.active_segment_id));
+        self.active_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&active_path)?;
+            
+        self.current_size = 0;
+        Ok(())
+    }
+
+    pub fn append(&mut self, record: &Record) -> io::Result<(u64, u64)> {
+        if self.current_size >= self.max_segment_size {
+            self.rotate()?;
+        }
+
+        let bytes = record.encode();
+        let offset_in_segment = self.current_size;
+
+        if let Err(e) = self.active_file.write_all(&bytes) {
+            let _ = self.active_file.set_len(offset_in_segment);
+            return Err(e);
+        }
+
+        self.current_size += bytes.len() as u64;
+        Ok((self.active_segment_id, offset_in_segment))
+    }
+
+    pub fn sync(&self) -> io::Result<()> {
+        self.active_file.sync_data()
+    }
+
+    pub fn active_segment_id(&self) -> u64 {
+        self.active_segment_id
+    }
+
+    pub fn current_size(&self) -> u64 {
+        self.current_size
+    }
+
+    pub fn iter_all(&self) -> io::Result<WalIteratorAll> {
+        let mut segment_ids = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(id_str) = name.strip_prefix("nesso.").and_then(|s| s.strip_suffix(".wal")) {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            segment_ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        segment_ids.sort_unstable();
+
+        Ok(WalIteratorAll {
+            dir: self.dir.clone(),
+            segment_ids,
+            current_segment_idx: 0,
+            current_file: None,
+            current_segment_id: 0,
+            current_offset: 0,
+        })
+    }
+}
+
+pub struct WalIteratorAll {
+    dir: PathBuf,
+    segment_ids: Vec<u64>,
+    current_segment_idx: usize,
+    current_file: Option<File>,
+    current_segment_id: u64,
+    current_offset: u64,
+}
+
+impl Iterator for WalIteratorAll {
+    type Item = io::Result<(u64, u64, Record)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current_file.is_none() {
+                if self.current_segment_idx >= self.segment_ids.len() {
+                    return None;
+                }
+                self.current_segment_id = self.segment_ids[self.current_segment_idx];
+                let path = self.dir.join(format!("nesso.{:05}.wal", self.current_segment_id));
+                match File::open(&path) {
+                    Ok(f) => {
+                        self.current_file = Some(f);
+                        self.current_offset = 0;
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+
+            let file = self.current_file.as_mut().unwrap();
+            let mut header = [0u8; HEADER_SIZE];
+            let offset_in_segment = self.current_offset;
+
+            match file.read_exact(&mut header) {
+                Ok(()) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    self.current_file = None;
+                    self.current_segment_idx += 1;
+                    continue;
+                }
+                Err(e) => return Some(Err(e)),
+            }
+
+            if header[0] != MAGIC_BYTE {
+                self.current_file = None;
+                self.current_segment_idx += 1;
+                continue;
+            }
+
+            let payload_len = extract_payload_len(&header);
+            let mut payload = vec![0u8; payload_len];
+
+            if let Err(e) = file.read_exact(&mut payload) {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    self.current_file = None;
+                    self.current_segment_idx += 1;
+                    continue;
+                }
+                return Some(Err(e));
+            }
+
+            let mut full_record = Vec::with_capacity(HEADER_SIZE + payload_len);
+            full_record.extend_from_slice(&header);
+            full_record.extend_from_slice(&payload);
+
+            self.current_offset += HEADER_SIZE as u64 + payload_len as u64;
+
+            match Record::decode(&full_record) {
+                Some(record) => return Some(Ok((self.current_segment_id, offset_in_segment, record))),
+                None => continue,
+            }
+        }
+    }
+}
