@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -7,6 +8,14 @@ use super::record::{Record, HEADER_SIZE, MAGIC_BYTE};
 
 pub const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
 const MAX_LRU_CACHE_SIZE: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct CompactionStats {
+    pub closed_segments_compacted: usize,
+    pub surviving_records: usize,
+    pub new_segment_id: u64,
+}
 
 #[inline]
 fn extract_payload_len(header: &[u8]) -> usize {
@@ -24,6 +33,11 @@ impl WalReader {
             dir,
             read_cache: Mutex::new(Vec::with_capacity(MAX_LRU_CACHE_SIZE)),
         }
+    }
+
+    pub fn clear_cache(&self) {
+        let mut cache = self.read_cache.lock().unwrap();
+        cache.clear();
     }
 
     pub fn read_at(&self, segment_id: u64, offset: u64) -> io::Result<Option<Record>> {
@@ -94,6 +108,10 @@ impl Wal {
             let path = entry.path();
             if path.is_file() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(".compacting") || name.ends_with(".tmp") {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
                     if let Some(id_str) = name.strip_prefix("nesso.").and_then(|s| s.strip_suffix(".wal")) {
                         if let Ok(id) = id_str.parse::<u64>() {
                             if id > max_id { max_id = id; }
@@ -161,12 +179,161 @@ impl Wal {
         self.active_file.sync_data()
     }
 
+    pub fn active_file_clone(&self) -> io::Result<File> {
+        self.active_file.try_clone()
+    }
+
     pub fn active_segment_id(&self) -> u64 {
         self.active_segment_id
     }
 
     pub fn current_size(&self) -> u64 {
         self.current_size
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn compact(&mut self) -> io::Result<Option<CompactionStats>> {
+        let res = self.compact_with_offsets()?;
+        Ok(res.map(|(stats, _)| stats))
+    }
+
+    /// Discovers all closed segments with id < active_segment_id.
+    pub fn plan_compaction(dir: &Path, active_segment_id: u64) -> io::Result<Option<Vec<u64>>> {
+        let mut closed_segments = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(id_str) = name.strip_prefix("nesso.").and_then(|s| s.strip_suffix(".wal")) {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            if id < active_segment_id {
+                                closed_segments.push(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        closed_segments.sort_unstable();
+
+        if closed_segments.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(closed_segments))
+        }
+    }
+
+    /// Phase 1 (Non-Blocking I/O): Reads closed segments, performs global deduplication,
+    /// writes surviving records to atomic temporary file `nesso.00001.compacting`,
+    /// and issues `sync_data()`. Can be executed without holding any locks.
+    pub fn execute_compaction_phase1(dir: &Path, closed_segments: &[u64]) -> io::Result<(CompactionStats, HashMap<u64, u64>)> {
+        let mut latest_records: HashMap<u64, Record> = HashMap::new();
+
+        for &seg_id in closed_segments {
+            let path = dir.join(format!("nesso.{:05}.wal", seg_id));
+            let mut file = File::open(&path)?;
+
+            loop {
+                let mut header = [0u8; HEADER_SIZE];
+                match file.read_exact(&mut header) {
+                    Ok(()) => {}
+                    Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                }
+
+                if header[0] != MAGIC_BYTE {
+                    break;
+                }
+
+                let payload_len = extract_payload_len(&header);
+                let mut payload = vec![0u8; payload_len];
+                if let Err(e) = file.read_exact(&mut payload) {
+                    if e.kind() == io::ErrorKind::UnexpectedEof { break; }
+                    return Err(e);
+                }
+
+                let mut full_record = Vec::with_capacity(HEADER_SIZE + payload_len);
+                full_record.extend_from_slice(&header);
+                full_record.extend_from_slice(&payload);
+
+                if let Some(record) = Record::decode(&full_record) {
+                    match record.op_type() {
+                        super::record::OpType::Acked | super::record::OpType::DeadLettered => {
+                            latest_records.remove(&record.id());
+                        }
+                        _ => {
+                            latest_records.insert(record.id(), record);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write to atomic temporary file: nesso.00001.compacting
+        let temp_path = dir.join("nesso.00001.compacting");
+        let mut temp_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)?;
+
+        let mut surviving_ids: Vec<u64> = latest_records.keys().copied().collect();
+        surviving_ids.sort_unstable();
+
+        let mut new_offsets = HashMap::new();
+        let mut current_offset = 0u64;
+
+        for id in &surviving_ids {
+            let record = &latest_records[id];
+            let bytes = record.encode();
+            temp_file.write_all(&bytes)?;
+            new_offsets.insert(*id, current_offset);
+            current_offset += bytes.len() as u64;
+        }
+
+        temp_file.sync_data()?;
+        drop(temp_file);
+
+        let stats = CompactionStats {
+            closed_segments_compacted: closed_segments.len(),
+            surviving_records: surviving_ids.len(),
+            new_segment_id: 1,
+        };
+
+        Ok((stats, new_offsets))
+    }
+
+    /// Phase 2 (Atomic Swap): Atomically renames `nesso.00001.compacting` over `nesso.00001.wal`
+    /// and unlinks obsolete closed segments. Must be executed under lock alongside in-memory index updates.
+    pub fn execute_compaction_phase2(dir: &Path, closed_segments: &[u64]) -> io::Result<()> {
+        let temp_path = dir.join("nesso.00001.compacting");
+        let dest_path = dir.join("nesso.00001.wal");
+        fs::rename(&temp_path, &dest_path)?;
+
+        for &seg_id in closed_segments {
+            if seg_id > 1 {
+                let p = dir.join(format!("nesso.{:05}.wal", seg_id));
+                let _ = fs::remove_file(p);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn compact_with_offsets(&mut self) -> io::Result<Option<(CompactionStats, HashMap<u64, u64>)>> {
+        let closed_segments = match Self::plan_compaction(&self.dir, self.active_segment_id)? {
+            Some(segs) => segs,
+            None => return Ok(None),
+        };
+
+        let (stats, new_offsets) = Self::execute_compaction_phase1(&self.dir, &closed_segments)?;
+        Self::execute_compaction_phase2(&self.dir, &closed_segments)?;
+
+        Ok(Some((stats, new_offsets)))
     }
 
     pub fn iter_all(&self) -> io::Result<WalIteratorAll> {

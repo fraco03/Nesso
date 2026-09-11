@@ -19,7 +19,7 @@ pub struct Record {
 }
 
 pub const MAGIC_BYTE: u8 = 0x4E; // 'N'
-// Header size: Magic(1) + Checksum(4) + OpType(1) + Priority(1) + ID(8) + PayloadLen(4) = 19
+// Header size: Magic(1) + Checksum(4) + OpType(1) + Priority(1) + ID(8) + PayloadLen(4) = 19 bytes
 pub const HEADER_SIZE: usize = 19;
 
 impl Record {
@@ -35,7 +35,7 @@ impl Record {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(HEADER_SIZE + self.payload.len());
         buf.push(MAGIC_BYTE);
-        buf.extend_from_slice(&[0, 0, 0, 0]); // Placeholder for checksum
+        buf.extend_from_slice(&[0, 0, 0, 0]); // CRC32 checksum placeholder
 
         let start_of_data = buf.len();
         buf.push(self.op_type as u8);

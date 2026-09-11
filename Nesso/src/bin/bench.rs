@@ -29,7 +29,7 @@ struct RunResult {
 struct BenchResult {
     system: String,
     threads: usize,
-nominal_tasks: usize,
+    nominal_tasks: usize,
     sync: bool,
     op: String,
     runs: Vec<RunResult>,
@@ -64,7 +64,7 @@ impl BenchResult {
 }
 
 // ---------------------------------------------------------------------------
-// main
+// Main benchmark entrypoint
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
@@ -82,7 +82,7 @@ async fn main() {
     // Start the Nesso HTTP server once
     let nesso_http_dir = PathBuf::from("bench_nesso_http_data");
     let _ = fs::remove_dir_all(&nesso_http_dir);
-    let router = Nesso::server::create_router(nesso_http_dir.clone());
+    let router = nesso::server::create_router(nesso_http_dir.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8181")
         .await
         .unwrap();
@@ -279,7 +279,7 @@ async fn main() {
                 let _ = fs::remove_dir_all(&nesso_dir);
                 fs::create_dir_all(&nesso_dir).unwrap();
                 let engine =
-                    Nesso::storage::engine::Engine::open(&nesso_dir).unwrap();
+                    nesso::storage::engine::Engine::open(&nesso_dir, None).unwrap();
 
                 // --- Nesso In-Process Push ---
                 let counter = Arc::new(AtomicU64::new(0));
@@ -733,7 +733,7 @@ async fn main() {
     }
 
     // --- Per-run detail ---
-    md.push_str("\n## Dettaglio Per-Run (dati grezzi verificabili)\n\n");
+    md.push_str("\n## Per-Run Detail (Raw Verifiable Data)\n\n");
     md.push_str(
         "| System | Threads | Sync | Op | Run | Dispatched | OnDisk | Integrity | Throughput | p50 | p99 |\n",
     );
@@ -760,34 +760,33 @@ async fn main() {
     }
 
     // --- Interpretation ---
-    md.push_str("\n## Interpretazione\n\n");
+    md.push_str("\n## Analysis & Interpretation\n\n");
     md.push_str(
-        "**Confronto alla pari (In-Process vs In-Process)**: Nesso In-Process \
-         vs SQLite In-Process è l'unico confronto metodologicamente corretto \
-         per valutare il motore di storage. Nesso HTTP vs SQLite In-Process \
-         misura una cosa diversa (motore + stack di rete vs motore puro) e va \
-         interpretato come tale.\n\n",
+        "**Apples-to-Apples Comparison (In-Process vs In-Process)**: Nesso In-Process \
+         vs SQLite In-Process is the primary methodologically sound comparison \
+         for evaluating storage engine performance. Nesso HTTP vs SQLite In-Process \
+         measures two distinct architectures (storage engine + asynchronous HTTP/TCP stack \
+         vs an embedded in-memory/file library) and should be interpreted accordingly.\n\n",
     );
     md.push_str(
-        "**Scalabilità multi-thread**: SQLite WAL permette una sola scrittura \
-         alla volta. Con 16 thread concorrenti, i writer competono per il lock \
-         del file generando contesa pesante (gestita internamente da \
-         `busy_timeout`). Nesso serializza le scritture dietro un `Mutex` in \
-         RAM senza mai collidere a livello di filesystem.\n\n",
+        "**Multi-Threaded Scalability**: SQLite WAL allows only a single active \
+         writer at any given time. Under 16 concurrent threads, writers heavily \
+         compete for the database file lock (managed via `busy_timeout`). In contrast, \
+         Nesso serializes appends via an in-RAM mutex into an append-only WAL without \
+         filesystem-level lock contention.\n\n",
     );
     md.push_str(
-        "**Costo di sync=true**: I numeri di Nesso con sync (~250 ops/s push) \
-         rappresentano il limite hardware dell'SSD per operazioni fsync \
-         individuali. SQLite mostra throughput più alti con `synchronous=FULL` \
-         perché in modalità WAL il flush avviene solo sull'append del journal, \
-         non su ogni singola pagina del database — è un design architetturale \
-         diverso, non un vantaggio intrinseco del motore. **Attenzione: su macOS \
-         nessuno dei due sistemi garantisce un flush fisico reale senza \
-         F_FULLFSYNC (vedi sezione limitazioni).**\n",
+        "**Durability Overhead (`sync=true`)**: Operations with individual fsync \
+         are strictly bounded by physical SSD capabilities. SQLite with `synchronous=FULL` \
+         shows higher throughput because WAL mode flushes the write-ahead log rather than \
+         individual b-tree database pages — an architectural design difference rather than an \
+         inherent engine speed difference. **Caveat on macOS**: Standard POSIX `fsync()` on \
+         macOS flushes to drive cache rather than guaranteeing a platter/NAND barrier without \
+         `fcntl(F_FULLFSYNC)`. See BENCHMARK.md for deep analysis.\n",
     );
 
     fs::write("benchmark_results.md", &md).unwrap();
-    println!("\nBenchmark completo.");
+    println!("\nBenchmark complete.");
     println!("  → benchmark_results.csv");
     println!("  → benchmark_results.md");
 }

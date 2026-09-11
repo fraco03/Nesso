@@ -3,24 +3,6 @@
 version = 4
 
 [[package]]
-name = "Nesso"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.23.1",
- "crc32fast",
- "getset",
- "hdrhistogram",
- "rand",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "statrs",
- "tokio",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -955,6 +937,25 @@ dependencies = [
  "rand",
  "simba",
  "typenum",
+]
+
+[[package]]
+name = "nesso"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "crc32fast",
+ "getset",
+ "hdrhistogram",
+ "rand",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "statrs",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

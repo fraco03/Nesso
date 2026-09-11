@@ -1,4 +1,4 @@
-use Nesso::storage::engine::Engine;
+use nesso::storage::engine::Engine;
 use std::env;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +18,7 @@ fn temp_wal_path(test_name: &str) -> std::path::PathBuf {
 #[test]
 fn test_concurrent_push() {
     let path = temp_wal_path("push");
-    let engine = Arc::new(Engine::open(&path).unwrap());
+    let engine = Arc::new(Engine::open(&path, None).unwrap());
     
     let mut handles = vec![];
     let num_threads = 10;
@@ -44,7 +44,7 @@ fn test_concurrent_push() {
 #[test]
 fn test_no_double_delivery() {
     let path = temp_wal_path("delivery");
-    let engine = Arc::new(Engine::open(&path).unwrap());
+    let engine = Arc::new(Engine::open(&path, None).unwrap());
     
     let total_items = 1000;
     for _ in 0..total_items {
@@ -82,7 +82,7 @@ fn test_no_double_delivery() {
 #[test]
 fn test_mutex_poison_recovery_simulated() {
     let path = temp_wal_path("poison");
-    let engine = Engine::open(&path).unwrap();
+    let engine = Engine::open(&path, None).unwrap();
     engine.push(b"data".to_vec(), 1).unwrap();
     
     // An application error in pop should not poison the lock (we use safe unwrapping now)
@@ -94,7 +94,7 @@ fn test_mutex_poison_recovery_simulated() {
 #[test]
 fn test_mpmc_chaos_stress() {
     let path = temp_wal_path("mpmc_chaos");
-    let engine = Arc::new(Engine::open(&path).unwrap());
+    let engine = Arc::new(Engine::open(&path, None).unwrap());
 
     let num_producers = 4;
     let tasks_per_producer = 250;
@@ -174,16 +174,15 @@ fn test_concurrent_append_with_rotation() {
     let path = temp_wal_path("concurrent_rotation");
     
     // Open Engine with a custom small threshold WAL (10 KB) to force heavy rotation under concurrency
-    let wal = Nesso::storage::wal::Wal::open(&path, Some(10 * 1024)).unwrap();
-    let state = Nesso::storage::engine::EngineState {
-        wal,
-        next_id: 1,
-        index: std::collections::HashMap::new(),
-        data_index: std::collections::HashMap::new(),
-        ready_queue: std::collections::BinaryHeap::new(),
-        leased: std::collections::HashMap::new(),
-    };
-    let engine = std::sync::Arc::new(Nesso::storage::engine::Engine { reader: std::sync::Arc::new(Nesso::storage::wal::WalReader::new(path.clone())), inner: std::sync::Arc::new(std::sync::Mutex::new(state)) });
+    let wal = nesso::storage::wal::Wal::open(&path, Some(10 * 1024)).unwrap();
+    let state = nesso::storage::engine::EngineState::new(wal);
+    let engine = std::sync::Arc::new(nesso::storage::engine::Engine {
+        reader: std::sync::Arc::new(nesso::storage::wal::WalReader::new(path.clone())),
+        inner: std::sync::Arc::new(std::sync::Mutex::new(state)),
+        group_commit: std::sync::Arc::new(nesso::storage::group_commit::GroupCommit::new(Default::default())),
+        expiration_worker: Default::default(),
+        compaction_lock: Default::default(),
+    });
 
     let num_threads = 10;
     let pushes_per_thread = 100;

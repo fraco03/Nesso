@@ -1,4 +1,4 @@
-use Nesso::storage::record::{OpType, Record};
+use nesso::storage::record::{OpType, Record};
 
 #[test]
 fn test_roundtrip_basic() {

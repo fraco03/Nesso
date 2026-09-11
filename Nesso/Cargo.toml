@@ -1,7 +1,8 @@
 [package]
-name = "Nesso"
+name = "nesso"
 version = "0.1.0"
 edition = "2024"
+default-run = "nesso"
 
 [dependencies]
 axum = "0.8.9"
@@ -16,3 +17,4 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 statrs = "0.19.1"
 tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"

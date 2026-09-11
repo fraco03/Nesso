@@ -1,6 +1,7 @@
-use Nesso::storage::record::{OpType, Record};
-use Nesso::storage::wal::{Wal, WalReader};
-use Nesso::storage::engine::Engine;
+use nesso::storage::record::{OpType, Record};
+use nesso::storage::wal::{Wal, WalReader};
+use nesso::storage::engine::{Engine, EngineState};
+use nesso::storage::group_commit::GroupCommit;
 use std::env;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,7 +59,7 @@ fn test_iter_all_multiple_segments() {
     wal.append(&Record::new(2, OpType::Created, 1, vec![0; 90])).unwrap(); // seg 2
     wal.append(&Record::new(3, OpType::Created, 1, vec![0; 90])).unwrap(); // seg 3
     
-    for r in wal.iter_all().unwrap() { println!("Read: {:?}", r); } for r in fs::read_dir(&dir).unwrap() { println!("File: {:?}", r.unwrap().path()); } let records: Vec<_> = wal.iter_all().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let records: Vec<_> = wal.iter_all().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 3);
     assert_eq!(records[0].0, 1);
     assert_eq!(records[1].0, 2);
@@ -99,7 +100,7 @@ fn test_iter_with_truncated_intermediate_segment() {
     wal.append(&Record::new(99, OpType::Created, 1, vec![0; 200])).unwrap();
     wal.append(&Record::new(2, OpType::Created, 1, vec![2; 20])).unwrap();
     
-    for r in wal.iter_all().unwrap() { println!("Read: {:?}", r); } for r in fs::read_dir(&dir).unwrap() { println!("File: {:?}", r.unwrap().path()); } let records: Vec<_> = wal.iter_all().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let records: Vec<_> = wal.iter_all().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].0, 1); // From seg 1
     assert_eq!(records[1].0, 2); // From seg 2
@@ -114,15 +115,14 @@ fn test_engine_e2e_segment_recovery() {
     {
         // Open Engine with a custom small threshold WAL to force segmentation quickly
         let wal = Wal::open(&dir, Some(150)).unwrap(); 
-        let state = Nesso::storage::engine::EngineState {
-            wal,
-            next_id: 1,
-            index: std::collections::HashMap::new(),
-            data_index: std::collections::HashMap::new(),
-            ready_queue: std::collections::BinaryHeap::new(),
-            leased: std::collections::HashMap::new(),
+        let state = EngineState::new(wal);
+        let engine = Engine {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(state)),
+            reader: std::sync::Arc::new(WalReader::new(dir.clone())),
+            group_commit: std::sync::Arc::new(GroupCommit::new(Default::default())),
+            expiration_worker: Default::default(),
+            compaction_lock: Default::default(),
         };
-        let engine = Engine { inner: std::sync::Arc::new(std::sync::Mutex::new(state)), reader: std::sync::Arc::new(WalReader::new(dir.clone())) };
         
         // Push 3 tasks, spanning multiple segments
         engine.push(vec![0; 80], 1).unwrap(); 
@@ -135,7 +135,7 @@ fn test_engine_e2e_segment_recovery() {
     
     {
         // Reopen with standard 64MB limit, testing cross-segment recovery
-        let engine = Engine::open(&dir).unwrap();
+        let engine = Engine::open(&dir, None).unwrap();
         let state = engine.inner.lock().unwrap();
         
         assert_eq!(state.ready_queue.len(), 2);
@@ -166,7 +166,7 @@ fn test_iter_with_corrupt_magic_byte_full_header() {
     wal.append(&Record::new(99, OpType::Created, 1, vec![0; 200])).unwrap(); wal.append(&Record::new(2, OpType::Created, 1, vec![2; 20])).unwrap(); // triggers seg 2
     
     // Read via iter_all. It should skip the corrupted part of seg 1, and read seg 2 perfectly.
-    for r in wal.iter_all().unwrap() { println!("Read: {:?}", r); } for r in fs::read_dir(&dir).unwrap() { println!("File: {:?}", r.unwrap().path()); } let records: Vec<_> = wal.iter_all().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let records: Vec<_> = wal.iter_all().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].0, 1);
     assert_eq!(records[1].0, 2);
@@ -177,15 +177,14 @@ fn test_recovery_expires_stale_lease_spanning_segments() {
     let dir = temp_wal_dir("stale_lease_segmented");
     let id = {
         let wal = Wal::open(&dir, Some(100)).unwrap();
-        let state = Nesso::storage::engine::EngineState {
-            wal,
-            next_id: 1,
-            index: std::collections::HashMap::new(),
-            data_index: std::collections::HashMap::new(),
-            ready_queue: std::collections::BinaryHeap::new(),
-            leased: std::collections::HashMap::new(),
+        let state = EngineState::new(wal);
+        let engine = Engine {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(state)),
+            reader: std::sync::Arc::new(WalReader::new(dir.clone())),
+            group_commit: std::sync::Arc::new(GroupCommit::new(Default::default())),
+            expiration_worker: Default::default(),
+            compaction_lock: Default::default(),
         };
-        let engine = Engine { inner: std::sync::Arc::new(std::sync::Mutex::new(state)), reader: std::sync::Arc::new(WalReader::new(dir.clone())) };
         
         let id = engine.push(vec![1, 2, 3], 5).unwrap(); // Seg 1
         engine.push(vec![0; 80], 1).unwrap(); // Forces rotation to Seg 2
@@ -195,7 +194,7 @@ fn test_recovery_expires_stale_lease_spanning_segments() {
     
     std::thread::sleep(std::time::Duration::from_millis(1500)); // Lease expires offline
     
-    let engine = Engine::open(&dir).unwrap(); // Standard recovery
+    let engine = Engine::open(&dir, None).unwrap(); // Standard recovery
     let state = engine.inner.lock().unwrap();
     
     assert!(!state.leased.contains_key(&id));

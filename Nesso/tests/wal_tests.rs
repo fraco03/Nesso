@@ -1,9 +1,8 @@
-use Nesso::storage::record::{OpType, Record};
-use Nesso::storage::wal::{Wal, WalReader};
+use nesso::storage::record::{OpType, Record};
+use nesso::storage::wal::{Wal, WalReader};
 use std::env;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::io::Write;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
