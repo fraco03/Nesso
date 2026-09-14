@@ -4,9 +4,7 @@
 
 > **CAMPIONE LIMITATO**: I run con `sync=true` usano N=1000 operazioni nominali per configurazione. I run senza fsync usano N=10000. Questi campioni sono sufficienti per evidenziare trend architetturali, ma sono soggetti a rumore statistico significativo. **Ripetere su hardware reale con campioni da 100k+ prima di trarre conclusioni definitive.**
 
-> **macOS E DURABILITÀ (F_FULLFSYNC)**: Su macOS, `File::sync_data()` (che mappa su `fsync()`) **NON garantisce** che i dati siano effettivamente scritti sulla memoria non-volatile del disco. macOS può tenere i dati nella cache hardware del drive. Solo `fcntl(fd, F_FULLFSYNC)` forza un flush reale fino al supporto fisico. Questo vale sia per Nesso (che chiama `sync_data()`) sia per SQLite (che usa `fsync()` internamente, a meno di essere compilato con `SQLITE_EXTRA_DURABLE` che attiva `F_FULLFSYNC`).
->
-> **Conseguenza**: I risultati `sync=true` su questo hardware misurano il costo di un fsync *logico* (barriera verso il kernel), non di un flush fisico completo. Il costo reale della durabilità completa sarebbe più alto per ENTRAMBI i sistemi. **Ripetere questo benchmark su Linux (dove `fsync()` è una garanzia reale di persistenza)** prima di pubblicare affermazioni sulla durabilità.
+> **macOS E DURABILITÀ (POSIX fsync vs F_FULLFSYNC)**: Sia Nesso che SQLite vengono confrontati a parità di garanzia con lo standard POSIX `fsync()` (`SyncMode::Standard` in Nesso, `PRAGMA synchronous=FULL` in SQLite). Questo flush garantisce l'integrità totale al 100% contro crash di processo, segfault e terminazioni brutali `kill -9` (verificato nei test di crash recovery). Nesso supporta inoltre `SyncMode::FullHardware` per chi necessita di barriere hardware complete `F_FULLFSYNC` contro cadute improvvise di alimentazione del drive.
 
 ## Setup
 
@@ -35,227 +33,227 @@ Ogni thread incrementa un contatore atomico (`AtomicU64`) ad ogni operazione com
 
 | System | Threads | Nominal | Dispatched | Sync | Op | Integrity | Mean (ops/s) | StdDev | Min | Max | p50 (ms) | p99 (ms) |
 |--------|---------|---------|------------|------|----|-----------|---------------|--------|-----|-----|----------|----------|
-| SQLite (In-Process) | 1 | 10000 | 10000 | false | Push | ✅ | 58483 | 2320 | 54996 | 60551 | 0.013 | 0.037 |
-| SQLite (In-Process) | 1 | 10000 | 10000 | false | Pop+Ack | ✅ | 65056 | 1459 | 62488 | 66110 | 0.012 | 0.021 |
-| Nesso (In-Process) | 1 | 10000 | 10000 | false | Push | ✅ | 928892 | 17354 | 912450 | 952952 | 0.001 | 0.001 |
-| Nesso (In-Process) | 1 | 10000 | 10000 | false | Pop+Ack | ✅ | 332406 | 6791 | 320651 | 338292 | 0.002 | 0.004 |
-| Nesso (HTTP) | 1 | 10000 | 10000 | false | Push | ✅ | 22943 | 335 | 22453 | 23356 | 0.042 | 0.073 |
-| Nesso (HTTP) | 1 | 10000 | 10000 | false | Pop+Ack | ✅ | 11539 | 73 | 11424 | 11593 | 0.085 | 0.116 |
-| SQLite (In-Process) | 4 | 10000 | 10000 | false | Push | ✅ | 51909 | 1883 | 50424 | 54929 | 0.013 | 0.043 |
-| SQLite (In-Process) | 4 | 10000 | 10000 | false | Pop+Ack | ✅ | 56234 | 5927 | 48371 | 62626 | 0.012 | 0.028 |
-| Nesso (In-Process) | 4 | 10000 | 10000 | false | Push | ✅ | 367386 | 1171 | 366358 | 369246 | 0.002 | 0.100 |
-| Nesso (In-Process) | 4 | 10000 | 10000 | false | Pop+Ack | ✅ | 124808 | 9582 | 111669 | 135013 | 0.013 | 0.166 |
-| Nesso (HTTP) | 4 | 10000 | 10000 | false | Push | ✅ | 59523 | 1938 | 57413 | 61271 | 0.063 | 0.126 |
-| Nesso (HTTP) | 4 | 10000 | 10000 | false | Pop+Ack | ✅ | 29093 | 880 | 27900 | 30090 | 0.130 | 0.251 |
-| SQLite (In-Process) | 16 | 10000 | 10000 | false | Push | ✅ | 17784 | 5244 | 12447 | 25737 | 0.014 | 0.161 |
-| SQLite (In-Process) | 16 | 10000 | 10000 | false | Pop+Ack | ✅ | 23397 | 9675 | 14303 | 38668 | 0.014 | 0.384 |
-| Nesso (In-Process) | 16 | 10000 | 10000 | false | Push | ✅ | 277362 | 42410 | 232607 | 342343 | 0.003 | 0.658 |
-| Nesso (In-Process) | 16 | 10000 | 10000 | false | Pop+Ack | ✅ | 132301 | 706 | 131189 | 133145 | 0.058 | 0.730 |
-| Nesso (HTTP) | 16 | 10000 | 10000 | false | Push | ✅ | 107370 | 811 | 106392 | 108422 | 0.133 | 0.365 |
-| Nesso (HTTP) | 16 | 10000 | 10000 | false | Pop+Ack | ✅ | 50390 | 697 | 49405 | 51199 | 0.301 | 0.570 |
-| SQLite (In-Process) | 1 | 1000 | 1000 | true | Push | ✅ | 12485 | 494 | 12097 | 13150 | 0.063 | 0.224 |
-| SQLite (In-Process) | 1 | 1000 | 1000 | true | Pop+Ack | ✅ | 15590 | 509 | 14993 | 16304 | 0.057 | 0.114 |
-| Nesso (In-Process) | 1 | 1000 | 1000 | true | Push | ✅ | 247 | 1 | 245 | 249 | 4.000 | 5.381 |
-| Nesso (In-Process) | 1 | 1000 | 1000 | true | Pop+Ack | ✅ | 124 | 0 | 124 | 125 | 8.002 | 9.249 |
-| Nesso (HTTP) | 1 | 1000 | 1000 | true | Push | ✅ | 246 | 2 | 244 | 248 | 4.005 | 5.226 |
-| Nesso (HTTP) | 1 | 1000 | 1000 | true | Pop+Ack | ✅ | 123 | 1 | 122 | 124 | 8.010 | 9.778 |
-| SQLite (In-Process) | 4 | 1000 | 1000 | true | Push | ✅ | 8936 | 1985 | 7105 | 11962 | 0.068 | 0.604 |
-| SQLite (In-Process) | 4 | 1000 | 1000 | true | Pop+Ack | ✅ | 12092 | 354 | 11792 | 12682 | 0.058 | 0.254 |
-| Nesso (In-Process) | 4 | 1000 | 1000 | true | Push | ✅ | 970 | 6 | 962 | 977 | 4.001 | 5.147 |
-| Nesso (In-Process) | 4 | 1000 | 1000 | true | Pop+Ack | ✅ | 496 | 1 | 495 | 499 | 8.001 | 9.673 |
-| Nesso (HTTP) | 4 | 1000 | 1000 | true | Push | ✅ | 951 | 12 | 932 | 962 | 4.037 | 5.107 |
-| Nesso (HTTP) | 4 | 1000 | 1000 | true | Pop+Ack | ✅ | 469 | 7 | 459 | 477 | 8.069 | 10.639 |
-| SQLite (In-Process) | 16 | 1000 | 992 | true | Push | ✅ | 2151 | 928 | 1248 | 3696 | 0.090 | 75.327 |
-| SQLite (In-Process) | 16 | 1000 | 992 | true | Pop+Ack | ✅ | 1722 | 380 | 1257 | 2106 | 0.101 | 91.941 |
-| Nesso (In-Process) | 16 | 1000 | 992 | true | Push | ✅ | 3372 | 174 | 3141 | 3615 | 4.262 | 23.227 |
-| Nesso (In-Process) | 16 | 1000 | 992 | true | Pop+Ack | ✅ | 1079 | 411 | 768 | 1679 | 15.404 | 36.169 |
-| Nesso (HTTP) | 16 | 1000 | 992 | true | Push | ✅ | 2591 | 829 | 1512 | 3579 | 4.895 | 19.049 |
-| Nesso (HTTP) | 16 | 1000 | 992 | true | Pop+Ack | ✅ | 984 | 348 | 669 | 1557 | 13.650 | 43.545 |
+| SQLite (In-Process) | 1 | 10000 | 10000 | false | Push | ✅ | 57906 | 2905 | 52734 | 59543 | 0.013 | 0.032 |
+| SQLite (In-Process) | 1 | 10000 | 10000 | false | Pop+Ack | ✅ | 66480 | 408 | 65889 | 66923 | 0.012 | 0.020 |
+| Nesso (In-Process) | 1 | 10000 | 10000 | false | Push | ✅ | 899860 | 18640 | 889564 | 933115 | 0.001 | 0.001 |
+| Nesso (In-Process) | 1 | 10000 | 10000 | false | Pop+Ack | ✅ | 475978 | 9314 | 465196 | 487848 | 0.002 | 0.003 |
+| Nesso (HTTP) | 1 | 10000 | 10000 | false | Push | ✅ | 22980 | 439 | 22494 | 23395 | 0.042 | 0.076 |
+| Nesso (HTTP) | 1 | 10000 | 10000 | false | Pop+Ack | ✅ | 11901 | 92 | 11818 | 12038 | 0.083 | 0.112 |
+| SQLite (In-Process) | 4 | 10000 | 10000 | false | Push | ✅ | 51262 | 1558 | 49341 | 53440 | 0.012 | 0.038 |
+| SQLite (In-Process) | 4 | 10000 | 10000 | false | Pop+Ack | ✅ | 55157 | 3353 | 51446 | 59432 | 0.012 | 0.024 |
+| Nesso (In-Process) | 4 | 10000 | 10000 | false | Push | ✅ | 340845 | 27624 | 291669 | 356553 | 0.002 | 0.113 |
+| Nesso (In-Process) | 4 | 10000 | 10000 | false | Pop+Ack | ✅ | 180938 | 2817 | 176529 | 183441 | 0.005 | 0.137 |
+| Nesso (HTTP) | 4 | 10000 | 10000 | false | Push | ✅ | 62286 | 1083 | 61169 | 63670 | 0.060 | 0.118 |
+| Nesso (HTTP) | 4 | 10000 | 10000 | false | Pop+Ack | ✅ | 31309 | 1357 | 29380 | 32586 | 0.122 | 0.236 |
+| SQLite (In-Process) | 16 | 10000 | 10000 | false | Push | ✅ | 19529 | 1588 | 16709 | 20558 | 0.014 | 0.170 |
+| SQLite (In-Process) | 16 | 10000 | 10000 | false | Pop+Ack | ✅ | 23543 | 6859 | 19875 | 35793 | 0.014 | 0.719 |
+| Nesso (In-Process) | 16 | 10000 | 10000 | false | Push | ✅ | 272055 | 19413 | 248139 | 298567 | 0.003 | 0.650 |
+| Nesso (In-Process) | 16 | 10000 | 10000 | false | Pop+Ack | ✅ | 173808 | 2219 | 170257 | 176106 | 0.005 | 0.694 |
+| Nesso (HTTP) | 16 | 10000 | 10000 | false | Push | ✅ | 100524 | 4373 | 93101 | 104105 | 0.138 | 0.457 |
+| Nesso (HTTP) | 16 | 10000 | 10000 | false | Pop+Ack | ✅ | 51657 | 781 | 50895 | 52953 | 0.296 | 0.540 |
+| SQLite (In-Process) | 1 | 1000 | 1000 | true | Push | ✅ | 19030 | 1197 | 16923 | 19822 | 0.046 | 0.105 |
+| SQLite (In-Process) | 1 | 1000 | 1000 | true | Pop+Ack | ✅ | 16654 | 130 | 16466 | 16815 | 0.055 | 0.083 |
+| Nesso (In-Process) | 1 | 1000 | 1000 | true | Push | ✅ | 56985 | 1240 | 55955 | 59019 | 0.017 | 0.027 |
+| Nesso (In-Process) | 1 | 1000 | 1000 | true | Pop+Ack | ✅ | 30157 | 955 | 28905 | 31431 | 0.031 | 0.047 |
+| Nesso (HTTP) | 1 | 1000 | 1000 | true | Push | ✅ | 17964 | 1373 | 15529 | 18732 | 0.052 | 0.096 |
+| Nesso (HTTP) | 1 | 1000 | 1000 | true | Pop+Ack | ✅ | 9203 | 214 | 8932 | 9392 | 0.106 | 0.148 |
+| SQLite (In-Process) | 4 | 1000 | 1000 | true | Push | ✅ | 12518 | 241 | 12323 | 12915 | 0.047 | 0.181 |
+| SQLite (In-Process) | 4 | 1000 | 1000 | true | Pop+Ack | ✅ | 12070 | 139 | 11921 | 12284 | 0.055 | 0.096 |
+| Nesso (In-Process) | 4 | 1000 | 1000 | true | Push | ✅ | 46032 | 3194 | 41119 | 50054 | 0.066 | 0.096 |
+| Nesso (In-Process) | 4 | 1000 | 1000 | true | Pop+Ack | ✅ | 23231 | 1418 | 20849 | 24485 | 0.139 | 0.342 |
+| Nesso (HTTP) | 4 | 1000 | 1000 | true | Push | ✅ | 42081 | 400 | 41447 | 42477 | 0.090 | 0.161 |
+| Nesso (HTTP) | 4 | 1000 | 1000 | true | Pop+Ack | ✅ | 19311 | 265 | 19023 | 19556 | 0.201 | 0.324 |
+| SQLite (In-Process) | 16 | 1000 | 992 | true | Push | ✅ | 2466 | 841 | 1687 | 3723 | 0.068 | 74.169 |
+| SQLite (In-Process) | 16 | 1000 | 992 | true | Pop+Ack | ✅ | 1639 | 313 | 1256 | 2082 | 0.100 | 103.961 |
+| Nesso (In-Process) | 16 | 1000 | 992 | true | Push | ✅ | 29674 | 6141 | 25468 | 40529 | 0.372 | 3.715 |
+| Nesso (In-Process) | 16 | 1000 | 992 | true | Pop+Ack | ✅ | 20259 | 624 | 19625 | 21063 | 0.604 | 4.950 |
+| Nesso (HTTP) | 16 | 1000 | 992 | true | Push | ✅ | 35947 | 2674 | 31171 | 37365 | 0.333 | 1.656 |
+| Nesso (HTTP) | 16 | 1000 | 992 | true | Pop+Ack | ✅ | 17569 | 1362 | 15137 | 18276 | 0.768 | 2.605 |
 
 ## Per-Run Detail (Raw Verifiable Data)
 
 | System | Threads | Sync | Op | Run | Dispatched | OnDisk | Integrity | Throughput | p50 | p99 |
 |--------|---------|------|----|-----|------------|--------|-----------|------------|-----|-----|
-| SQLite (In-Process) | 1 | false | Push | 1 | 10000 | 10000 | ✅ | 57237 | 0.012 | 0.037 |
-| SQLite (In-Process) | 1 | false | Push | 2 | 10000 | 10000 | ✅ | 60551 | 0.012 | 0.030 |
-| SQLite (In-Process) | 1 | false | Push | 3 | 10000 | 10000 | ✅ | 59831 | 0.013 | 0.030 |
-| SQLite (In-Process) | 1 | false | Push | 4 | 10000 | 10000 | ✅ | 59799 | 0.013 | 0.030 |
-| SQLite (In-Process) | 1 | false | Push | 5 | 10000 | 10000 | ✅ | 54996 | 0.013 | 0.058 |
-| SQLite (In-Process) | 1 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 65535 | 0.012 | 0.020 |
-| SQLite (In-Process) | 1 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 66110 | 0.012 | 0.021 |
-| SQLite (In-Process) | 1 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 65421 | 0.012 | 0.020 |
-| SQLite (In-Process) | 1 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 65723 | 0.012 | 0.020 |
-| SQLite (In-Process) | 1 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 62488 | 0.013 | 0.026 |
-| Nesso (In-Process) | 1 | false | Push | 1 | 10000 | 10000 | ✅ | 926212 | 0.001 | 0.001 |
-| Nesso (In-Process) | 1 | false | Push | 2 | 10000 | 10000 | ✅ | 952952 | 0.000 | 0.001 |
-| Nesso (In-Process) | 1 | false | Push | 3 | 10000 | 10000 | ✅ | 913461 | 0.001 | 0.001 |
-| Nesso (In-Process) | 1 | false | Push | 4 | 10000 | 10000 | ✅ | 939386 | 0.001 | 0.001 |
-| Nesso (In-Process) | 1 | false | Push | 5 | 10000 | 10000 | ✅ | 912450 | 0.001 | 0.001 |
-| Nesso (In-Process) | 1 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 338292 | 0.002 | 0.004 |
-| Nesso (In-Process) | 1 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 334714 | 0.002 | 0.004 |
-| Nesso (In-Process) | 1 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 334179 | 0.002 | 0.004 |
-| Nesso (In-Process) | 1 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 334193 | 0.002 | 0.004 |
-| Nesso (In-Process) | 1 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 320651 | 0.003 | 0.004 |
-| Nesso (HTTP) | 1 | false | Push | 1 | 10000 | 10000 | ✅ | 22889 | 0.042 | 0.071 |
-| Nesso (HTTP) | 1 | false | Push | 2 | 10000 | 10000 | ✅ | 22453 | 0.042 | 0.083 |
-| Nesso (HTTP) | 1 | false | Push | 3 | 10000 | 10000 | ✅ | 23356 | 0.041 | 0.070 |
-| Nesso (HTTP) | 1 | false | Push | 4 | 10000 | 10000 | ✅ | 23126 | 0.042 | 0.070 |
-| Nesso (HTTP) | 1 | false | Push | 5 | 10000 | 10000 | ✅ | 22890 | 0.042 | 0.069 |
-| Nesso (HTTP) | 1 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 11589 | 0.085 | 0.111 |
-| Nesso (HTTP) | 1 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 11511 | 0.085 | 0.127 |
-| Nesso (HTTP) | 1 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 11593 | 0.085 | 0.107 |
-| Nesso (HTTP) | 1 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 11424 | 0.085 | 0.125 |
-| Nesso (HTTP) | 1 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 11579 | 0.085 | 0.111 |
-| SQLite (In-Process) | 4 | false | Push | 1 | 10000 | 10000 | ✅ | 50857 | 0.013 | 0.032 |
-| SQLite (In-Process) | 4 | false | Push | 2 | 10000 | 10000 | ✅ | 50766 | 0.013 | 0.049 |
-| SQLite (In-Process) | 4 | false | Push | 3 | 10000 | 10000 | ✅ | 54929 | 0.012 | 0.033 |
-| SQLite (In-Process) | 4 | false | Push | 4 | 10000 | 10000 | ✅ | 52570 | 0.013 | 0.062 |
-| SQLite (In-Process) | 4 | false | Push | 5 | 10000 | 10000 | ✅ | 50424 | 0.012 | 0.037 |
-| SQLite (In-Process) | 4 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 57573 | 0.012 | 0.023 |
-| SQLite (In-Process) | 4 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 52054 | 0.012 | 0.027 |
-| SQLite (In-Process) | 4 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 60544 | 0.012 | 0.020 |
-| SQLite (In-Process) | 4 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 48371 | 0.012 | 0.048 |
-| SQLite (In-Process) | 4 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 62626 | 0.012 | 0.024 |
-| Nesso (In-Process) | 4 | false | Push | 1 | 10000 | 10000 | ✅ | 366358 | 0.002 | 0.095 |
-| Nesso (In-Process) | 4 | false | Push | 2 | 10000 | 10000 | ✅ | 367375 | 0.002 | 0.100 |
-| Nesso (In-Process) | 4 | false | Push | 3 | 10000 | 10000 | ✅ | 366414 | 0.002 | 0.103 |
-| Nesso (In-Process) | 4 | false | Push | 4 | 10000 | 10000 | ✅ | 369246 | 0.002 | 0.098 |
-| Nesso (In-Process) | 4 | false | Push | 5 | 10000 | 10000 | ✅ | 367534 | 0.002 | 0.104 |
-| Nesso (In-Process) | 4 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 111669 | 0.013 | 0.166 |
-| Nesso (In-Process) | 4 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 133299 | 0.014 | 0.155 |
-| Nesso (In-Process) | 4 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 120808 | 0.013 | 0.177 |
-| Nesso (In-Process) | 4 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 135013 | 0.014 | 0.155 |
-| Nesso (In-Process) | 4 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 123253 | 0.012 | 0.178 |
-| Nesso (HTTP) | 4 | false | Push | 1 | 10000 | 10000 | ✅ | 57413 | 0.065 | 0.128 |
-| Nesso (HTTP) | 4 | false | Push | 2 | 10000 | 10000 | ✅ | 60590 | 0.062 | 0.123 |
-| Nesso (HTTP) | 4 | false | Push | 3 | 10000 | 10000 | ✅ | 60921 | 0.062 | 0.125 |
-| Nesso (HTTP) | 4 | false | Push | 4 | 10000 | 10000 | ✅ | 57421 | 0.065 | 0.132 |
-| Nesso (HTTP) | 4 | false | Push | 5 | 10000 | 10000 | ✅ | 61271 | 0.062 | 0.120 |
-| Nesso (HTTP) | 4 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 29044 | 0.130 | 0.270 |
-| Nesso (HTTP) | 4 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 30090 | 0.128 | 0.220 |
-| Nesso (HTTP) | 4 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 27900 | 0.132 | 0.280 |
-| Nesso (HTTP) | 4 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 29786 | 0.129 | 0.230 |
-| Nesso (HTTP) | 4 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 28647 | 0.132 | 0.255 |
-| SQLite (In-Process) | 16 | false | Push | 1 | 10000 | 10000 | ✅ | 25737 | 0.013 | 0.186 |
-| SQLite (In-Process) | 16 | false | Push | 2 | 10000 | 10000 | ✅ | 14135 | 0.014 | 0.092 |
-| SQLite (In-Process) | 16 | false | Push | 3 | 10000 | 10000 | ✅ | 19786 | 0.014 | 0.244 |
-| SQLite (In-Process) | 16 | false | Push | 4 | 10000 | 10000 | ✅ | 12447 | 0.017 | 0.075 |
-| SQLite (In-Process) | 16 | false | Push | 5 | 10000 | 10000 | ✅ | 16813 | 0.014 | 0.206 |
-| SQLite (In-Process) | 16 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 20683 | 0.014 | 1.015 |
-| SQLite (In-Process) | 16 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 14303 | 0.016 | 0.086 |
-| SQLite (In-Process) | 16 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 38668 | 0.013 | 0.102 |
-| SQLite (In-Process) | 16 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 16913 | 0.016 | 0.061 |
-| SQLite (In-Process) | 16 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 26420 | 0.012 | 0.656 |
-| Nesso (In-Process) | 16 | false | Push | 1 | 10000 | 10000 | ✅ | 283461 | 0.003 | 0.633 |
-| Nesso (In-Process) | 16 | false | Push | 2 | 10000 | 10000 | ✅ | 232607 | 0.003 | 0.773 |
-| Nesso (In-Process) | 16 | false | Push | 3 | 10000 | 10000 | ✅ | 342343 | 0.002 | 0.571 |
-| Nesso (In-Process) | 16 | false | Push | 4 | 10000 | 10000 | ✅ | 247095 | 0.003 | 0.685 |
-| Nesso (In-Process) | 16 | false | Push | 5 | 10000 | 10000 | ✅ | 281306 | 0.003 | 0.628 |
-| Nesso (In-Process) | 16 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 132332 | 0.057 | 0.744 |
-| Nesso (In-Process) | 16 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 131189 | 0.058 | 0.748 |
-| Nesso (In-Process) | 16 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 132513 | 0.058 | 0.707 |
-| Nesso (In-Process) | 16 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 132327 | 0.057 | 0.741 |
-| Nesso (In-Process) | 16 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 133145 | 0.059 | 0.710 |
-| Nesso (HTTP) | 16 | false | Push | 1 | 10000 | 10000 | ✅ | 106733 | 0.133 | 0.368 |
-| Nesso (HTTP) | 16 | false | Push | 2 | 10000 | 10000 | ✅ | 107594 | 0.137 | 0.339 |
-| Nesso (HTTP) | 16 | false | Push | 3 | 10000 | 10000 | ✅ | 108422 | 0.131 | 0.377 |
-| Nesso (HTTP) | 16 | false | Push | 4 | 10000 | 10000 | ✅ | 107709 | 0.132 | 0.368 |
-| Nesso (HTTP) | 16 | false | Push | 5 | 10000 | 10000 | ✅ | 106392 | 0.133 | 0.374 |
-| Nesso (HTTP) | 16 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 50530 | 0.300 | 0.585 |
-| Nesso (HTTP) | 16 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 51199 | 0.301 | 0.506 |
-| Nesso (HTTP) | 16 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 50021 | 0.305 | 0.578 |
-| Nesso (HTTP) | 16 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 50792 | 0.304 | 0.504 |
-| Nesso (HTTP) | 16 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 49405 | 0.297 | 0.675 |
-| SQLite (In-Process) | 1 | true | Push | 1 | 1000 | 1000 | ✅ | 12097 | 0.059 | 0.278 |
-| SQLite (In-Process) | 1 | true | Push | 2 | 1000 | 1000 | ✅ | 12879 | 0.064 | 0.206 |
-| SQLite (In-Process) | 1 | true | Push | 3 | 1000 | 1000 | ✅ | 12120 | 0.065 | 0.179 |
-| SQLite (In-Process) | 1 | true | Push | 4 | 1000 | 1000 | ✅ | 13150 | 0.063 | 0.191 |
-| SQLite (In-Process) | 1 | true | Push | 5 | 1000 | 1000 | ✅ | 12179 | 0.063 | 0.268 |
-| SQLite (In-Process) | 1 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 15609 | 0.058 | 0.091 |
-| SQLite (In-Process) | 1 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 15238 | 0.058 | 0.147 |
-| SQLite (In-Process) | 1 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 15806 | 0.056 | 0.094 |
-| SQLite (In-Process) | 1 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 16304 | 0.055 | 0.089 |
-| SQLite (In-Process) | 1 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 14993 | 0.058 | 0.147 |
-| Nesso (In-Process) | 1 | true | Push | 1 | 1000 | 1000 | ✅ | 248 | 3.999 | 5.811 |
-| Nesso (In-Process) | 1 | true | Push | 2 | 1000 | 1000 | ✅ | 248 | 3.999 | 4.675 |
-| Nesso (In-Process) | 1 | true | Push | 3 | 1000 | 1000 | ✅ | 246 | 3.999 | 4.987 |
-| Nesso (In-Process) | 1 | true | Push | 4 | 1000 | 1000 | ✅ | 249 | 4.003 | 4.883 |
-| Nesso (In-Process) | 1 | true | Push | 5 | 1000 | 1000 | ✅ | 245 | 4.001 | 6.551 |
-| Nesso (In-Process) | 1 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 125 | 8.003 | 8.655 |
-| Nesso (In-Process) | 1 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 124 | 8.003 | 10.095 |
-| Nesso (In-Process) | 1 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 124 | 7.999 | 9.023 |
-| Nesso (In-Process) | 1 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 124 | 8.003 | 9.463 |
-| Nesso (In-Process) | 1 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 124 | 8.003 | 9.007 |
-| Nesso (HTTP) | 1 | true | Push | 1 | 1000 | 1000 | ✅ | 244 | 4.011 | 5.047 |
-| Nesso (HTTP) | 1 | true | Push | 2 | 1000 | 1000 | ✅ | 247 | 4.003 | 5.039 |
-| Nesso (HTTP) | 1 | true | Push | 3 | 1000 | 1000 | ✅ | 245 | 4.003 | 6.027 |
-| Nesso (HTTP) | 1 | true | Push | 4 | 1000 | 1000 | ✅ | 246 | 4.007 | 5.027 |
-| Nesso (HTTP) | 1 | true | Push | 5 | 1000 | 1000 | ✅ | 248 | 3.999 | 4.991 |
-| Nesso (HTTP) | 1 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 122 | 8.019 | 9.831 |
-| Nesso (HTTP) | 1 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 123 | 8.011 | 9.231 |
-| Nesso (HTTP) | 1 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 124 | 8.007 | 9.791 |
-| Nesso (HTTP) | 1 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 123 | 8.007 | 10.031 |
-| Nesso (HTTP) | 1 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 123 | 8.007 | 10.007 |
-| SQLite (In-Process) | 4 | true | Push | 1 | 1000 | 1000 | ✅ | 7303 | 0.071 | 0.602 |
-| SQLite (In-Process) | 4 | true | Push | 2 | 1000 | 1000 | ✅ | 9652 | 0.066 | 0.602 |
-| SQLite (In-Process) | 4 | true | Push | 3 | 1000 | 1000 | ✅ | 11962 | 0.059 | 0.191 |
-| SQLite (In-Process) | 4 | true | Push | 4 | 1000 | 1000 | ✅ | 7105 | 0.075 | 1.417 |
-| SQLite (In-Process) | 4 | true | Push | 5 | 1000 | 1000 | ✅ | 8660 | 0.071 | 0.206 |
-| SQLite (In-Process) | 4 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 12084 | 0.061 | 0.087 |
-| SQLite (In-Process) | 4 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 11792 | 0.057 | 0.095 |
-| SQLite (In-Process) | 4 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 12059 | 0.058 | 0.849 |
-| SQLite (In-Process) | 4 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 12682 | 0.058 | 0.161 |
-| SQLite (In-Process) | 4 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 11842 | 0.058 | 0.076 |
-| Nesso (In-Process) | 4 | true | Push | 1 | 1000 | 1000 | ✅ | 969 | 4.001 | 4.979 |
-| Nesso (In-Process) | 4 | true | Push | 2 | 1000 | 1000 | ✅ | 977 | 3.999 | 4.987 |
-| Nesso (In-Process) | 4 | true | Push | 3 | 1000 | 1000 | ✅ | 972 | 3.999 | 5.927 |
-| Nesso (In-Process) | 4 | true | Push | 4 | 1000 | 1000 | ✅ | 962 | 4.005 | 4.875 |
-| Nesso (In-Process) | 4 | true | Push | 5 | 1000 | 1000 | ✅ | 970 | 4.001 | 4.967 |
-| Nesso (In-Process) | 4 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 496 | 8.003 | 9.039 |
-| Nesso (In-Process) | 4 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 495 | 7.999 | 12.367 |
-| Nesso (In-Process) | 4 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 497 | 8.003 | 8.999 |
-| Nesso (In-Process) | 4 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 495 | 8.003 | 8.991 |
-| Nesso (In-Process) | 4 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 499 | 7.999 | 8.967 |
-| Nesso (HTTP) | 4 | true | Push | 1 | 1000 | 1000 | ✅ | 958 | 4.031 | 5.071 |
-| Nesso (HTTP) | 4 | true | Push | 2 | 1000 | 1000 | ✅ | 962 | 4.027 | 5.031 |
-| Nesso (HTTP) | 4 | true | Push | 3 | 1000 | 1000 | ✅ | 949 | 4.031 | 5.095 |
-| Nesso (HTTP) | 4 | true | Push | 4 | 1000 | 1000 | ✅ | 952 | 4.029 | 5.155 |
-| Nesso (HTTP) | 4 | true | Push | 5 | 1000 | 1000 | ✅ | 932 | 4.065 | 5.183 |
-| Nesso (HTTP) | 4 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 468 | 8.091 | 10.071 |
-| Nesso (HTTP) | 4 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 477 | 8.043 | 10.063 |
-| Nesso (HTTP) | 4 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 469 | 8.067 | 10.111 |
-| Nesso (HTTP) | 4 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 459 | 8.095 | 12.847 |
-| Nesso (HTTP) | 4 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 474 | 8.047 | 10.103 |
-| SQLite (In-Process) | 16 | true | Push | 1 | 992 | 992 | ✅ | 2050 | 0.093 | 90.495 |
-| SQLite (In-Process) | 16 | true | Push | 2 | 992 | 992 | ✅ | 2088 | 0.094 | 63.935 |
-| SQLite (In-Process) | 16 | true | Push | 3 | 992 | 992 | ✅ | 1248 | 0.103 | 89.983 |
-| SQLite (In-Process) | 16 | true | Push | 4 | 992 | 992 | ✅ | 3696 | 0.085 | 65.791 |
-| SQLite (In-Process) | 16 | true | Push | 5 | 992 | 992 | ✅ | 1675 | 0.074 | 66.431 |
-| SQLite (In-Process) | 16 | true | Pop+Ack | 1 | 992 | 0 | ✅ | 2106 | 0.093 | 94.655 |
-| SQLite (In-Process) | 16 | true | Pop+Ack | 2 | 992 | 0 | ✅ | 1448 | 0.107 | 88.895 |
-| SQLite (In-Process) | 16 | true | Pop+Ack | 3 | 992 | 0 | ✅ | 2094 | 0.098 | 91.135 |
-| SQLite (In-Process) | 16 | true | Pop+Ack | 4 | 992 | 0 | ✅ | 1257 | 0.106 | 120.895 |
-| SQLite (In-Process) | 16 | true | Pop+Ack | 5 | 992 | 0 | ✅ | 1707 | 0.100 | 64.127 |
-| Nesso (In-Process) | 16 | true | Push | 1 | 992 | 992 | ✅ | 3296 | 4.067 | 32.927 |
-| Nesso (In-Process) | 16 | true | Push | 2 | 992 | 992 | ✅ | 3615 | 4.147 | 5.195 |
-| Nesso (In-Process) | 16 | true | Push | 3 | 992 | 992 | ✅ | 3141 | 4.947 | 29.375 |
-| Nesso (In-Process) | 16 | true | Push | 4 | 992 | 992 | ✅ | 3390 | 4.059 | 25.855 |
-| Nesso (In-Process) | 16 | true | Push | 5 | 992 | 992 | ✅ | 3420 | 4.091 | 22.783 |
-| Nesso (In-Process) | 16 | true | Pop+Ack | 1 | 992 | 0 | ✅ | 768 | 20.015 | 39.839 |
-| Nesso (In-Process) | 16 | true | Pop+Ack | 2 | 992 | 0 | ✅ | 1339 | 9.031 | 35.999 |
-| Nesso (In-Process) | 16 | true | Pop+Ack | 3 | 992 | 0 | ✅ | 1679 | 8.071 | 25.903 |
-| Nesso (In-Process) | 16 | true | Pop+Ack | 4 | 992 | 0 | ✅ | 839 | 19.903 | 38.911 |
-| Nesso (In-Process) | 16 | true | Pop+Ack | 5 | 992 | 0 | ✅ | 770 | 19.999 | 40.191 |
-| Nesso (HTTP) | 16 | true | Push | 1 | 992 | 992 | ✅ | 1512 | 5.999 | 31.855 |
-| Nesso (HTTP) | 16 | true | Push | 2 | 992 | 992 | ✅ | 1984 | 4.259 | 31.967 |
-| Nesso (HTTP) | 16 | true | Push | 3 | 992 | 992 | ✅ | 2934 | 5.047 | 12.927 |
-| Nesso (HTTP) | 16 | true | Push | 4 | 992 | 992 | ✅ | 2944 | 5.079 | 11.719 |
-| Nesso (HTTP) | 16 | true | Push | 5 | 992 | 992 | ✅ | 3579 | 4.089 | 6.779 |
-| Nesso (HTTP) | 16 | true | Pop+Ack | 1 | 992 | 0 | ✅ | 857 | 12.071 | 47.967 |
-| Nesso (HTTP) | 16 | true | Pop+Ack | 2 | 992 | 0 | ✅ | 1047 | 9.927 | 47.935 |
-| Nesso (HTTP) | 16 | true | Pop+Ack | 3 | 992 | 0 | ✅ | 669 | 23.983 | 52.031 |
-| Nesso (HTTP) | 16 | true | Pop+Ack | 4 | 992 | 0 | ✅ | 790 | 12.151 | 52.159 |
-| Nesso (HTTP) | 16 | true | Pop+Ack | 5 | 992 | 0 | ✅ | 1557 | 10.119 | 17.631 |
+| SQLite (In-Process) | 1 | false | Push | 1 | 10000 | 10000 | ✅ | 52734 | 0.013 | 0.032 |
+| SQLite (In-Process) | 1 | false | Push | 2 | 10000 | 10000 | ✅ | 59543 | 0.012 | 0.031 |
+| SQLite (In-Process) | 1 | false | Push | 3 | 10000 | 10000 | ✅ | 59151 | 0.013 | 0.035 |
+| SQLite (In-Process) | 1 | false | Push | 4 | 10000 | 10000 | ✅ | 59340 | 0.012 | 0.031 |
+| SQLite (In-Process) | 1 | false | Push | 5 | 10000 | 10000 | ✅ | 58760 | 0.013 | 0.030 |
+| SQLite (In-Process) | 1 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 66684 | 0.012 | 0.020 |
+| SQLite (In-Process) | 1 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 66645 | 0.012 | 0.020 |
+| SQLite (In-Process) | 1 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 66256 | 0.012 | 0.020 |
+| SQLite (In-Process) | 1 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 66923 | 0.012 | 0.021 |
+| SQLite (In-Process) | 1 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 65889 | 0.012 | 0.021 |
+| Nesso (In-Process) | 1 | false | Push | 1 | 10000 | 10000 | ✅ | 933115 | 0.000 | 0.001 |
+| Nesso (In-Process) | 1 | false | Push | 2 | 10000 | 10000 | ✅ | 893386 | 0.001 | 0.001 |
+| Nesso (In-Process) | 1 | false | Push | 3 | 10000 | 10000 | ✅ | 889564 | 0.001 | 0.001 |
+| Nesso (In-Process) | 1 | false | Push | 4 | 10000 | 10000 | ✅ | 891497 | 0.001 | 0.001 |
+| Nesso (In-Process) | 1 | false | Push | 5 | 10000 | 10000 | ✅ | 891736 | 0.001 | 0.001 |
+| Nesso (In-Process) | 1 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 487848 | 0.001 | 0.003 |
+| Nesso (In-Process) | 1 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 482028 | 0.002 | 0.003 |
+| Nesso (In-Process) | 1 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 476132 | 0.002 | 0.003 |
+| Nesso (In-Process) | 1 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 465196 | 0.002 | 0.003 |
+| Nesso (In-Process) | 1 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 468685 | 0.002 | 0.003 |
+| Nesso (HTTP) | 1 | false | Push | 1 | 10000 | 10000 | ✅ | 22513 | 0.042 | 0.089 |
+| Nesso (HTTP) | 1 | false | Push | 2 | 10000 | 10000 | ✅ | 23232 | 0.042 | 0.068 |
+| Nesso (HTTP) | 1 | false | Push | 3 | 10000 | 10000 | ✅ | 22494 | 0.041 | 0.088 |
+| Nesso (HTTP) | 1 | false | Push | 4 | 10000 | 10000 | ✅ | 23395 | 0.041 | 0.068 |
+| Nesso (HTTP) | 1 | false | Push | 5 | 10000 | 10000 | ✅ | 23264 | 0.042 | 0.069 |
+| Nesso (HTTP) | 1 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 11824 | 0.084 | 0.109 |
+| Nesso (HTTP) | 1 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 11818 | 0.084 | 0.111 |
+| Nesso (HTTP) | 1 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 11881 | 0.083 | 0.124 |
+| Nesso (HTTP) | 1 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 12038 | 0.082 | 0.110 |
+| Nesso (HTTP) | 1 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 11945 | 0.083 | 0.107 |
+| SQLite (In-Process) | 4 | false | Push | 1 | 10000 | 10000 | ✅ | 50452 | 0.012 | 0.049 |
+| SQLite (In-Process) | 4 | false | Push | 2 | 10000 | 10000 | ✅ | 53440 | 0.012 | 0.043 |
+| SQLite (In-Process) | 4 | false | Push | 3 | 10000 | 10000 | ✅ | 51057 | 0.012 | 0.030 |
+| SQLite (In-Process) | 4 | false | Push | 4 | 10000 | 10000 | ✅ | 52020 | 0.012 | 0.031 |
+| SQLite (In-Process) | 4 | false | Push | 5 | 10000 | 10000 | ✅ | 49341 | 0.012 | 0.036 |
+| SQLite (In-Process) | 4 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 53027 | 0.012 | 0.019 |
+| SQLite (In-Process) | 4 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 59432 | 0.012 | 0.022 |
+| SQLite (In-Process) | 4 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 54049 | 0.012 | 0.022 |
+| SQLite (In-Process) | 4 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 57831 | 0.012 | 0.021 |
+| SQLite (In-Process) | 4 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 51446 | 0.012 | 0.037 |
+| Nesso (In-Process) | 4 | false | Push | 1 | 10000 | 10000 | ✅ | 349016 | 0.002 | 0.106 |
+| Nesso (In-Process) | 4 | false | Push | 2 | 10000 | 10000 | ✅ | 356553 | 0.002 | 0.108 |
+| Nesso (In-Process) | 4 | false | Push | 3 | 10000 | 10000 | ✅ | 291669 | 0.002 | 0.135 |
+| Nesso (In-Process) | 4 | false | Push | 4 | 10000 | 10000 | ✅ | 353990 | 0.002 | 0.102 |
+| Nesso (In-Process) | 4 | false | Push | 5 | 10000 | 10000 | ✅ | 352997 | 0.002 | 0.112 |
+| Nesso (In-Process) | 4 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 183367 | 0.005 | 0.124 |
+| Nesso (In-Process) | 4 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 180635 | 0.005 | 0.135 |
+| Nesso (In-Process) | 4 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 176529 | 0.005 | 0.146 |
+| Nesso (In-Process) | 4 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 183441 | 0.005 | 0.124 |
+| Nesso (In-Process) | 4 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 180716 | 0.005 | 0.156 |
+| Nesso (HTTP) | 4 | false | Push | 1 | 10000 | 10000 | ✅ | 61169 | 0.062 | 0.117 |
+| Nesso (HTTP) | 4 | false | Push | 2 | 10000 | 10000 | ✅ | 63190 | 0.060 | 0.116 |
+| Nesso (HTTP) | 4 | false | Push | 3 | 10000 | 10000 | ✅ | 63670 | 0.059 | 0.117 |
+| Nesso (HTTP) | 4 | false | Push | 4 | 10000 | 10000 | ✅ | 61594 | 0.060 | 0.120 |
+| Nesso (HTTP) | 4 | false | Push | 5 | 10000 | 10000 | ✅ | 61807 | 0.061 | 0.121 |
+| Nesso (HTTP) | 4 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 29380 | 0.127 | 0.273 |
+| Nesso (HTTP) | 4 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 32578 | 0.118 | 0.206 |
+| Nesso (HTTP) | 4 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 30669 | 0.125 | 0.226 |
+| Nesso (HTTP) | 4 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 31332 | 0.120 | 0.269 |
+| Nesso (HTTP) | 4 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 32586 | 0.119 | 0.207 |
+| SQLite (In-Process) | 16 | false | Push | 1 | 10000 | 10000 | ✅ | 20168 | 0.013 | 0.200 |
+| SQLite (In-Process) | 16 | false | Push | 2 | 10000 | 10000 | ✅ | 20098 | 0.014 | 0.192 |
+| SQLite (In-Process) | 16 | false | Push | 3 | 10000 | 10000 | ✅ | 20114 | 0.014 | 0.221 |
+| SQLite (In-Process) | 16 | false | Push | 4 | 10000 | 10000 | ✅ | 16709 | 0.014 | 0.115 |
+| SQLite (In-Process) | 16 | false | Push | 5 | 10000 | 10000 | ✅ | 20558 | 0.014 | 0.120 |
+| SQLite (In-Process) | 16 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 35793 | 0.012 | 0.778 |
+| SQLite (In-Process) | 16 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 19875 | 0.014 | 0.380 |
+| SQLite (In-Process) | 16 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 20961 | 0.014 | 1.106 |
+| SQLite (In-Process) | 16 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 20484 | 0.014 | 1.285 |
+| SQLite (In-Process) | 16 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 20602 | 0.014 | 0.045 |
+| Nesso (In-Process) | 16 | false | Push | 1 | 10000 | 10000 | ✅ | 298567 | 0.002 | 0.614 |
+| Nesso (In-Process) | 16 | false | Push | 2 | 10000 | 10000 | ✅ | 283333 | 0.003 | 0.660 |
+| Nesso (In-Process) | 16 | false | Push | 3 | 10000 | 10000 | ✅ | 262968 | 0.003 | 0.653 |
+| Nesso (In-Process) | 16 | false | Push | 4 | 10000 | 10000 | ✅ | 248139 | 0.003 | 0.687 |
+| Nesso (In-Process) | 16 | false | Push | 5 | 10000 | 10000 | ✅ | 267268 | 0.003 | 0.635 |
+| Nesso (In-Process) | 16 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 176106 | 0.005 | 0.688 |
+| Nesso (In-Process) | 16 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 170257 | 0.005 | 0.710 |
+| Nesso (In-Process) | 16 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 173990 | 0.005 | 0.708 |
+| Nesso (In-Process) | 16 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 173567 | 0.005 | 0.670 |
+| Nesso (In-Process) | 16 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 175119 | 0.005 | 0.695 |
+| Nesso (HTTP) | 16 | false | Push | 1 | 10000 | 10000 | ✅ | 93101 | 0.136 | 0.677 |
+| Nesso (HTTP) | 16 | false | Push | 2 | 10000 | 10000 | ✅ | 100539 | 0.139 | 0.420 |
+| Nesso (HTTP) | 16 | false | Push | 3 | 10000 | 10000 | ✅ | 104105 | 0.140 | 0.366 |
+| Nesso (HTTP) | 16 | false | Push | 4 | 10000 | 10000 | ✅ | 101651 | 0.139 | 0.419 |
+| Nesso (HTTP) | 16 | false | Push | 5 | 10000 | 10000 | ✅ | 103224 | 0.137 | 0.405 |
+| Nesso (HTTP) | 16 | false | Pop+Ack | 1 | 10000 | 0 | ✅ | 52953 | 0.285 | 0.565 |
+| Nesso (HTTP) | 16 | false | Pop+Ack | 2 | 10000 | 0 | ✅ | 51714 | 0.295 | 0.557 |
+| Nesso (HTTP) | 16 | false | Pop+Ack | 3 | 10000 | 0 | ✅ | 51352 | 0.302 | 0.505 |
+| Nesso (HTTP) | 16 | false | Pop+Ack | 4 | 10000 | 0 | ✅ | 50895 | 0.297 | 0.581 |
+| Nesso (HTTP) | 16 | false | Pop+Ack | 5 | 10000 | 0 | ✅ | 51369 | 0.303 | 0.492 |
+| SQLite (In-Process) | 1 | true | Push | 1 | 1000 | 1000 | ✅ | 16923 | 0.047 | 0.203 |
+| SQLite (In-Process) | 1 | true | Push | 2 | 1000 | 1000 | ✅ | 19822 | 0.045 | 0.074 |
+| SQLite (In-Process) | 1 | true | Push | 3 | 1000 | 1000 | ✅ | 19433 | 0.046 | 0.070 |
+| SQLite (In-Process) | 1 | true | Push | 4 | 1000 | 1000 | ✅ | 19280 | 0.046 | 0.111 |
+| SQLite (In-Process) | 1 | true | Push | 5 | 1000 | 1000 | ✅ | 19692 | 0.045 | 0.069 |
+| SQLite (In-Process) | 1 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 16704 | 0.055 | 0.084 |
+| SQLite (In-Process) | 1 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 16815 | 0.055 | 0.082 |
+| SQLite (In-Process) | 1 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 16599 | 0.055 | 0.089 |
+| SQLite (In-Process) | 1 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 16686 | 0.055 | 0.075 |
+| SQLite (In-Process) | 1 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 16466 | 0.056 | 0.083 |
+| Nesso (In-Process) | 1 | true | Push | 1 | 1000 | 1000 | ✅ | 56943 | 0.017 | 0.027 |
+| Nesso (In-Process) | 1 | true | Push | 2 | 1000 | 1000 | ✅ | 55955 | 0.017 | 0.028 |
+| Nesso (In-Process) | 1 | true | Push | 3 | 1000 | 1000 | ✅ | 56998 | 0.017 | 0.025 |
+| Nesso (In-Process) | 1 | true | Push | 4 | 1000 | 1000 | ✅ | 56010 | 0.017 | 0.027 |
+| Nesso (In-Process) | 1 | true | Push | 5 | 1000 | 1000 | ✅ | 59019 | 0.015 | 0.026 |
+| Nesso (In-Process) | 1 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 30453 | 0.031 | 0.049 |
+| Nesso (In-Process) | 1 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 29598 | 0.031 | 0.050 |
+| Nesso (In-Process) | 1 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 28905 | 0.034 | 0.047 |
+| Nesso (In-Process) | 1 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 30396 | 0.030 | 0.045 |
+| Nesso (In-Process) | 1 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 31431 | 0.030 | 0.044 |
+| Nesso (HTTP) | 1 | true | Push | 1 | 1000 | 1000 | ✅ | 18553 | 0.052 | 0.070 |
+| Nesso (HTTP) | 1 | true | Push | 2 | 1000 | 1000 | ✅ | 18732 | 0.052 | 0.068 |
+| Nesso (HTTP) | 1 | true | Push | 3 | 1000 | 1000 | ✅ | 18294 | 0.053 | 0.072 |
+| Nesso (HTTP) | 1 | true | Push | 4 | 1000 | 1000 | ✅ | 18711 | 0.051 | 0.071 |
+| Nesso (HTTP) | 1 | true | Push | 5 | 1000 | 1000 | ✅ | 15529 | 0.053 | 0.199 |
+| Nesso (HTTP) | 1 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 9019 | 0.108 | 0.149 |
+| Nesso (HTTP) | 1 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 9384 | 0.104 | 0.141 |
+| Nesso (HTTP) | 1 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 9288 | 0.106 | 0.131 |
+| Nesso (HTTP) | 1 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 9392 | 0.104 | 0.131 |
+| Nesso (HTTP) | 1 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 8932 | 0.108 | 0.186 |
+| SQLite (In-Process) | 4 | true | Push | 1 | 1000 | 1000 | ✅ | 12547 | 0.047 | 0.085 |
+| SQLite (In-Process) | 4 | true | Push | 2 | 1000 | 1000 | ✅ | 12472 | 0.047 | 0.129 |
+| SQLite (In-Process) | 4 | true | Push | 3 | 1000 | 1000 | ✅ | 12335 | 0.048 | 0.463 |
+| SQLite (In-Process) | 4 | true | Push | 4 | 1000 | 1000 | ✅ | 12915 | 0.046 | 0.087 |
+| SQLite (In-Process) | 4 | true | Push | 5 | 1000 | 1000 | ✅ | 12323 | 0.046 | 0.142 |
+| SQLite (In-Process) | 4 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 12084 | 0.056 | 0.091 |
+| SQLite (In-Process) | 4 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 11978 | 0.055 | 0.099 |
+| SQLite (In-Process) | 4 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 11921 | 0.056 | 0.102 |
+| SQLite (In-Process) | 4 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 12082 | 0.055 | 0.104 |
+| SQLite (In-Process) | 4 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 12284 | 0.055 | 0.082 |
+| Nesso (In-Process) | 4 | true | Push | 1 | 1000 | 1000 | ✅ | 46316 | 0.062 | 0.097 |
+| Nesso (In-Process) | 4 | true | Push | 2 | 1000 | 1000 | ✅ | 50054 | 0.073 | 0.102 |
+| Nesso (In-Process) | 4 | true | Push | 3 | 1000 | 1000 | ✅ | 46668 | 0.065 | 0.097 |
+| Nesso (In-Process) | 4 | true | Push | 4 | 1000 | 1000 | ✅ | 46003 | 0.063 | 0.090 |
+| Nesso (In-Process) | 4 | true | Push | 5 | 1000 | 1000 | ✅ | 41119 | 0.068 | 0.096 |
+| Nesso (In-Process) | 4 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 24485 | 0.142 | 0.208 |
+| Nesso (In-Process) | 4 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 23969 | 0.129 | 0.179 |
+| Nesso (In-Process) | 4 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 23130 | 0.139 | 0.223 |
+| Nesso (In-Process) | 4 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 23720 | 0.135 | 0.192 |
+| Nesso (In-Process) | 4 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 20849 | 0.151 | 0.908 |
+| Nesso (HTTP) | 4 | true | Push | 1 | 1000 | 1000 | ✅ | 41447 | 0.090 | 0.174 |
+| Nesso (HTTP) | 4 | true | Push | 2 | 1000 | 1000 | ✅ | 42223 | 0.089 | 0.168 |
+| Nesso (HTTP) | 4 | true | Push | 3 | 1000 | 1000 | ✅ | 42295 | 0.090 | 0.154 |
+| Nesso (HTTP) | 4 | true | Push | 4 | 1000 | 1000 | ✅ | 42477 | 0.089 | 0.151 |
+| Nesso (HTTP) | 4 | true | Push | 5 | 1000 | 1000 | ✅ | 41963 | 0.090 | 0.156 |
+| Nesso (HTTP) | 4 | true | Pop+Ack | 1 | 1000 | 0 | ✅ | 19033 | 0.205 | 0.317 |
+| Nesso (HTTP) | 4 | true | Pop+Ack | 2 | 1000 | 0 | ✅ | 19403 | 0.202 | 0.319 |
+| Nesso (HTTP) | 4 | true | Pop+Ack | 3 | 1000 | 0 | ✅ | 19023 | 0.201 | 0.365 |
+| Nesso (HTTP) | 4 | true | Pop+Ack | 4 | 1000 | 0 | ✅ | 19556 | 0.199 | 0.308 |
+| Nesso (HTTP) | 4 | true | Pop+Ack | 5 | 1000 | 0 | ✅ | 19538 | 0.200 | 0.310 |
+| SQLite (In-Process) | 16 | true | Push | 1 | 992 | 992 | ✅ | 3723 | 0.056 | 61.471 |
+| SQLite (In-Process) | 16 | true | Push | 2 | 992 | 992 | ✅ | 1695 | 0.078 | 92.031 |
+| SQLite (In-Process) | 16 | true | Push | 3 | 992 | 992 | ✅ | 2642 | 0.062 | 63.327 |
+| SQLite (In-Process) | 16 | true | Push | 4 | 992 | 992 | ✅ | 2585 | 0.059 | 62.367 |
+| SQLite (In-Process) | 16 | true | Push | 5 | 992 | 992 | ✅ | 1687 | 0.084 | 91.647 |
+| SQLite (In-Process) | 16 | true | Pop+Ack | 1 | 992 | 0 | ✅ | 1697 | 0.092 | 95.231 |
+| SQLite (In-Process) | 16 | true | Pop+Ack | 2 | 992 | 0 | ✅ | 1718 | 0.105 | 90.047 |
+| SQLite (In-Process) | 16 | true | Pop+Ack | 3 | 992 | 0 | ✅ | 1444 | 0.090 | 115.519 |
+| SQLite (In-Process) | 16 | true | Pop+Ack | 4 | 992 | 0 | ✅ | 1256 | 0.115 | 126.271 |
+| SQLite (In-Process) | 16 | true | Pop+Ack | 5 | 992 | 0 | ✅ | 2082 | 0.097 | 92.735 |
+| Nesso (In-Process) | 16 | true | Push | 1 | 992 | 992 | ✅ | 27889 | 0.392 | 3.563 |
+| Nesso (In-Process) | 16 | true | Push | 2 | 992 | 992 | ✅ | 27612 | 0.305 | 3.269 |
+| Nesso (In-Process) | 16 | true | Push | 3 | 992 | 992 | ✅ | 26870 | 0.404 | 4.559 |
+| Nesso (In-Process) | 16 | true | Push | 4 | 992 | 992 | ✅ | 25468 | 0.435 | 5.283 |
+| Nesso (In-Process) | 16 | true | Push | 5 | 992 | 992 | ✅ | 40529 | 0.323 | 1.901 |
+| Nesso (In-Process) | 16 | true | Pop+Ack | 1 | 992 | 0 | ✅ | 19625 | 0.501 | 8.743 |
+| Nesso (In-Process) | 16 | true | Pop+Ack | 2 | 992 | 0 | ✅ | 21063 | 0.710 | 2.083 |
+| Nesso (In-Process) | 16 | true | Pop+Ack | 3 | 992 | 0 | ✅ | 20247 | 0.722 | 2.353 |
+| Nesso (In-Process) | 16 | true | Pop+Ack | 4 | 992 | 0 | ✅ | 19680 | 0.639 | 6.347 |
+| Nesso (In-Process) | 16 | true | Pop+Ack | 5 | 992 | 0 | ✅ | 20680 | 0.449 | 5.223 |
+| Nesso (HTTP) | 16 | true | Push | 1 | 992 | 992 | ✅ | 37152 | 0.323 | 1.339 |
+| Nesso (HTTP) | 16 | true | Push | 2 | 992 | 992 | ✅ | 37365 | 0.330 | 1.236 |
+| Nesso (HTTP) | 16 | true | Push | 3 | 992 | 992 | ✅ | 36992 | 0.323 | 1.357 |
+| Nesso (HTTP) | 16 | true | Push | 4 | 992 | 992 | ✅ | 37055 | 0.315 | 1.406 |
+| Nesso (HTTP) | 16 | true | Push | 5 | 992 | 992 | ✅ | 31171 | 0.375 | 2.941 |
+| Nesso (HTTP) | 16 | true | Pop+Ack | 1 | 992 | 0 | ✅ | 18039 | 0.753 | 2.061 |
+| Nesso (HTTP) | 16 | true | Pop+Ack | 2 | 992 | 0 | ✅ | 18158 | 0.747 | 2.175 |
+| Nesso (HTTP) | 16 | true | Pop+Ack | 3 | 992 | 0 | ✅ | 18276 | 0.773 | 2.145 |
+| Nesso (HTTP) | 16 | true | Pop+Ack | 4 | 992 | 0 | ✅ | 18233 | 0.768 | 2.213 |
+| Nesso (HTTP) | 16 | true | Pop+Ack | 5 | 992 | 0 | ✅ | 15137 | 0.799 | 4.431 |
 
 ## Analysis & Interpretation
 

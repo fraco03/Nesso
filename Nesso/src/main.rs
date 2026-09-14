@@ -3,7 +3,7 @@ use std::env;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use nesso::server::{self, AppState};
-use nesso::storage::engine::GroupCommitConfig;
+use nesso::storage::engine::{GroupCommitConfig, SyncMode};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -13,7 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut http_workers = default_workers;
     let mut batch_window_ms = 2u64;
     let mut max_batch_size = 64usize;
-    let mut idle_commit_threshold_us = 250u64;
+    let mut idle_commit_threshold_us = 0u64;
+    let mut sync_mode = SyncMode::Standard;
     let mut data_dir = env::current_dir()?.join("nesso_data");
     let mut bind_addr = "127.0.0.1:8080".to_string();
 
@@ -56,6 +57,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            "--sync-mode" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].to_lowercase().as_str() {
+                        "standard" | "posix" => sync_mode = SyncMode::Standard,
+                        "full" | "hardware" => sync_mode = SyncMode::FullHardware,
+                        other => {
+                            eprintln!("Error: unknown sync mode '{}'. Valid values: standard, full", other);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    eprintln!("Error: missing value for --sync-mode");
+                    std::process::exit(1);
+                }
+            }
             "--data-dir" => {
                 if i + 1 < args.len() {
                     data_dir = std::path::PathBuf::from(&args[i + 1]);
@@ -83,7 +100,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 println!("  --batch-window-ms <N>           Group commit batch window in milliseconds (default: 2)");
                 println!("  --max-batch-size <N>            Group commit maximum batch size (default: 64)");
-                println!("  --idle-commit-threshold-us <N>  Adaptive early commit idle threshold in microseconds (default: 250)");
+                println!("  --idle-commit-threshold-us <N>  Adaptive early commit idle threshold in microseconds (default: 0)");
+                println!("  --sync-mode <standard|full>     Durability sync mode (default: standard [POSIX fsync])");
                 println!("  --data-dir <PATH>               Directory for queue data (default: ./nesso_data)");
                 println!("  --bind <ADDR>                   Address to bind to (default: 127.0.0.1:8080)");
                 return Ok(());
@@ -117,6 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             batch_window: Duration::from_millis(batch_window_ms),
             max_batch_size,
             idle_commit_threshold: Duration::from_micros(idle_commit_threshold_us),
+            sync_mode,
         };
 
         let state = AppState::new_with_config(data_dir, group_commit_config);
@@ -125,8 +144,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let listener = TcpListener::bind(&bind_addr).await?;
         println!(
-            "Nesso server running on {} (http_workers: {}, batch_window: {}ms, max_batch: {}, idle_threshold: {}us)",
-            bind_addr, http_workers, batch_window_ms, max_batch_size, idle_commit_threshold_us
+            "Nesso server running on {} (http_workers: {}, batch_window: {}ms, max_batch: {}, idle_threshold: {}us, sync_mode: {:?})",
+            bind_addr, http_workers, batch_window_ms, max_batch_size, idle_commit_threshold_us, sync_mode
         );
 
         // Graceful shutdown:

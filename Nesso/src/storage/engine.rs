@@ -1,4 +1,4 @@
-use std::collections::{HashMap, BinaryHeap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Condvar};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
@@ -8,7 +8,9 @@ use std::path::Path;
 
 use super::record::{OpType, Record};
 use super::wal::{Wal, WalReader};
-pub use super::group_commit::{GroupCommit, GroupCommitConfig, GroupCommitOptions};
+use super::priority_queue::PriorityBucketQueue;
+use super::payload_cache::{PayloadCache, DEFAULT_PAYLOAD_CACHE_CAPACITY};
+pub use super::group_commit::{GroupCommit, GroupCommitConfig, GroupCommitOptions, SyncMode, perform_sync};
 
 pub struct ExpirationWorker {
     pub shutdown_flag: Arc<AtomicBool>,
@@ -94,8 +96,9 @@ pub struct EngineState {
     pub next_id: u64,
     pub index: HashMap<u64, (u64, u64)>,      // ID -> (segment_id, offset)
     pub data_index: HashMap<u64, (u64, u64)>, // ID -> (segment_id, offset)
-    pub ready_queue: BinaryHeap<TaskRef>,
+    pub ready_queue: PriorityBucketQueue,
     pub leased: HashMap<u64, LeaseInfo>,
+    pub payload_cache: PayloadCache,
     pub on_task_ready: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -165,11 +168,13 @@ impl Engine {
             let id = state.next_id;
             state.next_id += 1;
 
-            let record = Record::new(id, OpType::Created, priority, payload);
+            let payload_arc = Arc::new(payload);
+            let record = Record::new(id, OpType::Created, priority, (*payload_arc).clone());
             let (seg, off) = state.wal.append(&record)?;
 
             state.index.insert(id, (seg, off));
             state.data_index.insert(id, (seg, off));
+            state.payload_cache.insert(id, payload_arc);
             state.ready_queue.push(TaskRef { id, priority, retries: 0 });
 
             (id, state.on_task_ready.clone())
@@ -188,6 +193,7 @@ impl Engine {
         let retries;
         let data_seg;
         let data_off;
+        let cached_payload;
         
         {
             let mut state = self.inner.lock().unwrap();
@@ -229,11 +235,19 @@ impl Engine {
                 
             data_seg = seg_data;
             data_off = off_data;
+
+            // Check in-memory hot-path payload cache
+            cached_payload = state.payload_cache.get(id);
         } 
 
-        // Read-only I/O executed concurrently outside the lock
-        let original_record = self.reader.read_at(data_seg, data_off)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Record not found at offset"))?;
+        // If payload was cached in memory, return immediately without touching disk!
+        let original_record = if let Some(payload_arc) = cached_payload {
+            Record::new(id, OpType::Created, priority, (*payload_arc).clone())
+        } else {
+            // Read-only I/O executed concurrently outside the lock as fallback
+            self.reader.read_at(data_seg, data_off)?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Record not found at offset"))?
+        };
 
         Ok(Some((original_record, retries)))
     }
@@ -252,6 +266,7 @@ impl Engine {
             state.index.insert(id, (seg, off));
             state.leased.remove(&id);
             state.data_index.remove(&id);
+            state.payload_cache.remove(id);
             Ok(())
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "Task not found or not leased"))
@@ -303,6 +318,7 @@ impl Engine {
 
         if op == OpType::DeadLettered {
             state.data_index.remove(&id);
+            state.payload_cache.remove(id);
             Ok(false)
         } else {
             state.ready_queue.push(TaskRef { id, priority, retries: new_retries });
@@ -383,7 +399,7 @@ impl Engine {
     pub fn sync(&self) -> io::Result<()> {
         let active_file = {
             let state = self.inner.lock().unwrap();
-            state.wal.active_file_clone()?
+            state.wal.active_file_arc()
         };
 
         // =========================================================================
@@ -461,7 +477,7 @@ impl Engine {
     pub fn force_flush_group_commit(&self) -> io::Result<()> {
         let active_file = {
             let state = self.inner.lock().unwrap();
-            state.wal.active_file_clone()?
+            state.wal.active_file_arc()
         };
         self.group_commit.force_flush_and_wait(&active_file)
     }
@@ -482,6 +498,12 @@ impl Engine {
         self.group_commit.synced_batches()
     }
 
+    /// Returns the (hits, misses, evictions) statistics of the in-memory payload cache.
+    pub fn payload_cache_stats(&self) -> (u64, u64, u64) {
+        let state = self.inner.lock().unwrap();
+        state.payload_cache.stats()
+    }
+
     /// Complete shutdown of the Engine: forces group commit flush to disk,
     /// then stops and joins the background expiration worker.
     pub fn shutdown(&self) -> io::Result<()> {
@@ -493,13 +515,18 @@ impl Engine {
 
 impl EngineState {
     pub fn new(wal: Wal) -> Self {
+        Self::new_with_cache_capacity(wal, DEFAULT_PAYLOAD_CACHE_CAPACITY)
+    }
+
+    pub fn new_with_cache_capacity(wal: Wal, cache_capacity: usize) -> Self {
         Self {
             wal,
             next_id: 1,
             index: HashMap::new(),
             data_index: HashMap::new(),
-            ready_queue: BinaryHeap::new(),
+            ready_queue: PriorityBucketQueue::new(),
             leased: HashMap::new(),
+            payload_cache: PayloadCache::new(cache_capacity),
             on_task_ready: None,
         }
     }
@@ -519,8 +546,14 @@ impl EngineState {
             }
         }
 
-        let index_copy = self.index.clone();
-        for (id, &(segment, offset)) in index_copy.iter() {
+        let mut sorted_ids: Vec<u64> = self.index.keys().copied().collect();
+        sorted_ids.sort_unstable();
+
+        for id in sorted_ids {
+            let &(segment, offset) = match self.index.get(&id) {
+                Some(loc) => loc,
+                None => continue,
+            };
             if let Some(record) = reader.read_at(segment, offset)? {
                 match record.op_type() {
                     OpType::Created | OpType::Nacked | OpType::Expired => {
@@ -529,7 +562,7 @@ impl EngineState {
                         } else {
                             record.payload().first().copied().unwrap_or(0)
                         };
-                        self.ready_queue.push(TaskRef { id: *id, priority: record.priority(), retries });
+                        self.ready_queue.push(TaskRef { id, priority: record.priority(), retries });
                     }
                     OpType::Leased => {
                         let payload = record.payload();
@@ -540,22 +573,22 @@ impl EngineState {
                             
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             if expire_timestamp > now {
-                                self.leased.insert(*id, LeaseInfo {
+                                self.leased.insert(id, LeaseInfo {
                                     consumer_id,
                                     expire_timestamp,
                                     retries,
                                     priority: record.priority(),
                                 });
                             } else {
-                                self.ready_queue.push(TaskRef { id: *id, priority: record.priority(), retries });
+                                self.ready_queue.push(TaskRef { id, priority: record.priority(), retries });
                             }
                         } else {
-                            self.ready_queue.push(TaskRef { id: *id, priority: record.priority(), retries: 0 });
+                            self.ready_queue.push(TaskRef { id, priority: record.priority(), retries: 0 });
                         }
                     }
                     OpType::Acked | OpType::DeadLettered => {
-                        self.data_index.remove(id);
-                        self.index.remove(id);
+                        self.data_index.remove(&id);
+                        self.index.remove(&id);
                     }
                 }
             }

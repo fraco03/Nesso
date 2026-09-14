@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::record::{Record, HEADER_SIZE, MAGIC_BYTE};
+use super::group_commit::{perform_sync, SyncMode};
 
 pub const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
 const MAX_LRU_CACHE_SIZE: usize = 8;
@@ -89,7 +90,7 @@ impl WalReader {
 pub struct Wal {
     dir: PathBuf,
     active_segment_id: u64,
-    active_file: File,
+    active_file: Arc<File>,
     current_size: u64,
     max_segment_size: u64,
 }
@@ -136,24 +137,25 @@ impl Wal {
         Ok(Self {
             dir: dir.to_path_buf(),
             active_segment_id: max_id,
-            active_file,
+            active_file: Arc::new(active_file),
             current_size,
             max_segment_size: max_segment_size.unwrap_or(DEFAULT_MAX_SEGMENT_SIZE),
         })
     }
 
     fn rotate(&mut self) -> io::Result<()> {
-        self.active_file.sync_data()?;
+        perform_sync(&self.active_file, SyncMode::Standard)?;
         self.active_segment_id += 1;
         
         let active_path = self.dir.join(format!("nesso.{:05}.wal", self.active_segment_id));
-        self.active_file = OpenOptions::new()
+        let new_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .append(true)
             .open(&active_path)?;
             
+        self.active_file = Arc::new(new_file);
         self.current_size = 0;
         Ok(())
     }
@@ -166,7 +168,7 @@ impl Wal {
         let bytes = record.encode();
         let offset_in_segment = self.current_size;
 
-        if let Err(e) = self.active_file.write_all(&bytes) {
+        if let Err(e) = (&*self.active_file).write_all(&bytes) {
             let _ = self.active_file.set_len(offset_in_segment);
             return Err(e);
         }
@@ -176,7 +178,11 @@ impl Wal {
     }
 
     pub fn sync(&self) -> io::Result<()> {
-        self.active_file.sync_data()
+        perform_sync(&self.active_file, SyncMode::Standard)
+    }
+
+    pub fn active_file_arc(&self) -> Arc<File> {
+        Arc::clone(&self.active_file)
     }
 
     pub fn active_file_clone(&self) -> io::Result<File> {
@@ -295,7 +301,7 @@ impl Wal {
             current_offset += bytes.len() as u64;
         }
 
-        temp_file.sync_data()?;
+        perform_sync(&temp_file, SyncMode::Standard)?;
         drop(temp_file);
 
         let stats = CompactionStats {

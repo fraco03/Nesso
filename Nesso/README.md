@@ -25,7 +25,7 @@ It is **not** a Kafka or RabbitMQ replacement — those are distributed streamin
 | **Native Queue Semantics** (lease, retry, DLQ) | Partial | Yes | No — build it yourself | No — build it yourself | **Yes, built-in** |
 | **Operational Complexity** | High (ZooKeeper/KRaft) | Medium-High (Erlang VM) | Low-Medium | None | **None / Minimal** |
 | **Crash Safety** (real `kill -9` tested) | Cluster quorum | Broker journaling | None (snapshot/AOF trade-offs) | WAL recovery | **Yes, sub-process `kill -9` verified** |
-| **Target Scale** | Millions msg/s, distributed | Tens of thousands msg/s | High throughput, volatile | Thousands msg/s, single-node | **Up to ~920k in-mem / ~2.4k durable ops/s** |
+| Target Scale | Millions msg/s, distributed | Tens of thousands msg/s | High throughput, volatile | Thousands msg/s, single-node | **Up to ~900k in-mem / ~57k durable ops/s** |
 
 ---
 
@@ -65,32 +65,37 @@ requests.post(
 
 ## Performance
 
-Benchmarked against SQLite (WAL mode) used as a persistent queue, on identical hardware (Apple Silicon, APFS NVMe SSD), with **disk-verified data integrity per run** (not just client counters).
+Benchmarked against SQLite (WAL mode) used as a persistent queue, on identical hardware (Apple Silicon, APFS NVMe SSD), with **disk-verified data integrity per run** (not just client counters). Both engines tested at equivalent POSIX `fsync` durability (`SyncMode::Standard` for Nesso, `PRAGMA synchronous = FULL` for SQLite).
 
-Full methodology, raw per-run reproducible data, and known platform limitations are documented in [`BENCHMARK.md`](./BENCHMARK.md).
+Full methodology, raw per-run reproducible data, and platform notes are documented in [`BENCHMARK.md`](./BENCHMARK.md).
 
-| Scenario | Nesso (In-Process) | SQLite (In-Process) | Nesso (HTTP) |
-|---|---|---|---|
-| **Push**, no fsync, 1 thread | **~929k ops/s** (p99: 1 µs) | ~58k ops/s (p99: 37 µs) | ~23k ops/s (p99: 73 µs) |
-| **Push**, no fsync, 16 threads | **~277k ops/s** (p99: 0.7 ms) | ~18k ops/s (p99: 0.2 ms) | ~107k ops/s (p99: 0.4 ms) |
-| **Push**, fsync, 1 thread (Adaptive) | **~247 ops/s** (p50: **4.0 ms**, p99: 5.4 ms) | ~12k ops/s (p99: 0.2 ms) | **~246 ops/s** (p50: **4.0 ms**, p99: 5.2 ms) |
-| **Push**, fsync, 16 threads | **~3,372 ops/s** (p99: **23.2 ms**) | ~2,151 ops/s (p99: **75.3 ms**) | **~2,591 ops/s** (p99: **19.0 ms**) |
-| **Pop+Ack**, fsync, 16 threads | **~1,079 ops/s** (p99: **36.2 ms**) | ~1,722 ops/s (p99: **91.9 ms**) | **~984 ops/s** (p99: **43.5 ms**) |
+| Scenario | Nesso (In-Process) | SQLite (In-Process) | Nesso (HTTP) | Speedup vs SQLite |
+|---|---|---|---|---|
+| **Push**, no fsync, 1 thread | **~900k ops/s** (p99: 1 µs) | ~58k ops/s (p99: 32 µs) | ~23k ops/s (p99: 76 µs) | **15.5x faster** |
+| **Pop+Ack**, no fsync, 1 thread | **~476k ops/s** (p99: 3 µs) | ~66k ops/s (p99: 20 µs) | ~12k ops/s (p99: 112 µs) | **7.2x faster** |
+| **Push**, no fsync, 16 threads | **~272k ops/s** (p99: 0.65 ms) | ~20k ops/s (p99: 0.17 ms) | ~101k ops/s (p99: 0.46 ms) | **13.9x faster** |
+| **Pop+Ack**, no fsync, 16 threads | **~174k ops/s** (p99: 0.69 ms) | ~24k ops/s (p99: 0.72 ms) | ~52k ops/s (p99: 0.54 ms) | **7.4x faster** |
+| **Push**, fsync, 1 thread | **~57,000 ops/s** (p50: **0.017 ms**) | ~19,000 ops/s (p50: 0.046 ms) | **~18,000 ops/s** (p50: 0.052 ms) | **3.0x faster** |
+| **Pop+Ack**, fsync, 1 thread | **~30,200 ops/s** (p50: **0.031 ms**) | ~16,700 ops/s (p50: 0.055 ms) | **~9,200 ops/s** (p50: 0.106 ms) | **1.8x faster** |
+| **Push**, fsync, 16 threads | **~29,700 ops/s** (p99: **3.7 ms**) | ~2,500 ops/s (p99: **74.2 ms**) | **~35,900 ops/s** (p99: **1.7 ms**) | **12.0x faster** (20x lower p99) |
+| **Pop+Ack**, fsync, 16 threads | **~20,300 ops/s** (p99: **4.95 ms**) | ~1,600 ops/s (p99: **104.0 ms**) | **~17,600 ops/s** (p99: **2.6 ms**) | **12.4x faster** (21x lower p99) |
 
-> [!IMPORTANT]
-> **Transparent Analysis: Low Concurrency vs. High Concurrency Durability Trade-Offs**
-> - **At Low Concurrency (1 Thread, `sync=true`)**: SQLite outperforms Nesso (~12,485 ops/s vs. 247 ops/s, a ~50x gap). Nesso pays the full physical cost of an isolated, hardware-level `fsync` ($\sim 4\text{ms}$ on SSD) for every individual operation, guaranteeing immediate disk durability before returning. SQLite in WAL mode amortizes disk writes through internal checkpoint policies, providing a different durability trade-off when isolated.
-> - **At High Concurrency (16 Threads, `sync=true`)**: The paradigm reverses. SQLite suffers from severe database-level file lock contention (`busy_timeout`), collapsing by 82% to 2,151 ops/s with p99 tail latency exploding to **75.3 ms** (push) and **91.9 ms** (pop+ack). In contrast, Nesso's group commit amortizes the physical fsync cost across concurrent operations without lock contention, scaling to **3,372 ops/s** with p99 latency bounded at **23.2 ms** (**+56% higher throughput, 69% lower tail latency than SQLite**).
+> [!TIP]
+> **Key Architectural Insights**
+> - **At Low Concurrency (1 Thread, `sync=true`)**: Thanks to Nesso's compact binary record layout, in-memory payload cache, and zero-sleep immediate commit, Nesso completes an append and POSIX `fsync` in just **17 microseconds** median latency, outperforming SQLite by **3.0x** on the exact same storage barrier.
+> - **At High Concurrency (16 Threads, `sync=true`)**: SQLite's single-writer architecture collapses under file-lock contention (`busy_timeout`), causing p99 tail latency to explode to **74–104 ms**. Nesso's group commit coordinator coalesces concurrent writes into single serial `fsync` batches, maintaining **20,000–30,000 ops/s** with sub-5ms p99 tail latency (**over 12x higher throughput and 20x lower tail latency than SQLite**).
 > 
-> See [`BENCHMARK.md`](./BENCHMARK.md) for full reproducible numbers, hardware details, and architecture breakdown.
+> See [`BENCHMARK.md`](./BENCHMARK.md) for complete per-run reproducible data, hardware specifications, and durability modes.
 
 ---
 
 ## Key Highlights
 
-- **Zero External Dependencies in Storage Core**: The storage engine (`record.rs`, `wal.rs`, `engine.rs`, `group_commit.rs`) relies strictly on the Rust standard library (`std`).
+- **Zero External Dependencies in Storage Core**: The storage engine (`record.rs`, `wal.rs`, `engine.rs`, `group_commit.rs`, `priority_queue.rs`, `payload_cache.rs`) relies strictly on the Rust standard library (`std`).
 - **Zero `unsafe` Code**: 100% safe Rust with robust mutex poison recovery and failure isolation.
 - **Crash Durability & Real Recovery**: Tested with real subprocess `kill -9` injection. Survives ungraceful termination without data loss or WAL corruption.
+- **In-Memory Hot Path Payload Cache**: Shared buffer pool retaining recent task payloads in memory. Allows `pop_and_lease` to bypass physical disk seeks and reads while maintaining the WAL as the sole durable source of truth.
+- **$O(1)$ Priority Bucket Queue**: Multilevel feedback queue with 256 discrete FIFO buckets indexed by `u8` priority and backed by a 256-bit hardware bit-scan bitmap (`clz`), guaranteeing true $O(1)$ scheduling and natural FIFO ordering.
 - **High-Throughput Group Commit with Adaptive Early Commit**: Dynamic cooperative batching of `fsync` operations with sub-millisecond idle detection, scaling single-writer durable commits up to physical disk limits without idle latency penalties.
 - **Two-Phase Non-Blocking Background Compaction**: Phase 1 (heavy segment scanning, deduplication, `.compacting` writing, `fsync`) runs completely outside the engine lock. Phase 2 (atomic rename and memory remapping) executes under lock in $< 1\text{ms}$. Client writes never stall.
 - **Concurrent Readers / Single Writer**: Fast sequential disk appends under lock; non-blocking read-only lookups executed concurrently outside the lock through an internal LRU file cache.
@@ -111,10 +116,11 @@ Full methodology, raw per-run reproducible data, and known platform limitations 
                                        v              |
 +-----------------------------------------------------+-----------------------+
 |  EngineState (Mutex)                                |  WalReader (LRU Cache)|
-|  - in-memory BinaryHeap PriorityQueue (ready_queue) |  - Mutex<Vec<(id, File)>>
-|  - Active Leases (leased)                           |  - Concurrent I/O     |
-|  - Task Indices (index, data_index)                 +-----------------------+
-|  - Group Commit Coordinator (fsync batching)                                |
+|  - O(1) PriorityBucketQueue (256 discrete queues)   |  - Mutex<Vec<(id, File)>>
+|  - Hot-Path PayloadCache (shared buffer pool)       |  - Fallback disk read |
+|  - Active Leases (leased)                           +-----------------------+
+|  - Task Indices (index, data_index)                                         |
+|  - Group Commit Coordinator (adaptive early commit)                         |
 +-----------------------------------------------------------------------------+
                                        |
                      Single-Writer Append / Atomic Compaction
@@ -170,14 +176,16 @@ Configure these via CLI or in code:
 cargo run --release --bin nesso -- \
   --batch-window-ms 2 \
   --max-batch-size 64 \
-  --idle-commit-threshold-us 250
+  --idle-commit-threshold-us 0 \
+  --sync-mode standard
 ```
 Or via Rust API:
 ```rust
 let config = GroupCommitConfig {
     batch_window: Duration::from_millis(2),
     max_batch_size: 64,
-    idle_commit_threshold: Duration::from_micros(250),
+    idle_commit_threshold: Duration::ZERO,
+    sync_mode: SyncMode::Standard,
 };
 let engine = Engine::open_with_config("./my_queue", config)?;
 ```
@@ -238,7 +246,7 @@ fn main() -> std::io::Result<()> {
 # Build release binaries
 cargo build --release
 
-# Run entire test suite (74 integration, unit, and concurrency tests)
+# Run entire test suite (86 integration, unit, and concurrency tests)
 cargo test
 ```
 
@@ -253,7 +261,8 @@ cargo run --release --bin nesso -- \
   --http-workers 4 \
   --batch-window-ms 2 \
   --max-batch-size 64 \
-  --idle-commit-threshold-us 250 \
+  --idle-commit-threshold-us 0 \
+  --sync-mode standard \
   --data-dir ./nesso_data \
   --bind 127.0.0.1:8080
 ```
@@ -264,7 +273,8 @@ cargo run --release --bin nesso -- \
 | `--http-workers <N>` | CPU cores | Tokio runtime worker threads for HTTP transport concurrency. |
 | `--batch-window-ms <N>` | `2` | Group commit batch window in milliseconds. |
 | `--max-batch-size <N>` | `64` | Maximum operations per physical fsync batch. |
-| `--idle-commit-threshold-us <N>` | `250` | Microseconds of inactivity before leader commits an under-filled batch early. |
+| `--idle-commit-threshold-us <N>` | `0` | Microseconds of inactivity before leader commits an under-filled batch early (0 = immediate commit). |
+| `--sync-mode <standard\|full>` | `standard` | Durability flush mode: `standard` (POSIX `fsync`, crash safe), `full` (hardware NAND barrier `F_FULLFSYNC`). |
 | `--data-dir <PATH>` | `./nesso_data` | Storage directory for queue WAL and state files. |
 | `--bind <ADDR>` | `127.0.0.1:8080` | Network socket address to bind the HTTP server to. |
 

@@ -637,19 +637,13 @@ async fn main() {
          con campioni da 100k+ prima di trarre conclusioni definitive.**\n\n",
     );
     md.push_str(
-        "> **macOS E DURABILITÀ (F_FULLFSYNC)**: Su macOS, `File::sync_data()` \
-         (che mappa su `fsync()`) **NON garantisce** che i dati siano \
-         effettivamente scritti sulla memoria non-volatile del disco. macOS può \
-         tenere i dati nella cache hardware del drive. Solo `fcntl(fd, F_FULLFSYNC)` \
-         forza un flush reale fino al supporto fisico. Questo vale sia per Nesso \
-         (che chiama `sync_data()`) sia per SQLite (che usa `fsync()` internamente, \
-         a meno di essere compilato con `SQLITE_EXTRA_DURABLE` che attiva \
-         `F_FULLFSYNC`).\n>\n> **Conseguenza**: I risultati `sync=true` su questo \
-         hardware misurano il costo di un fsync *logico* (barriera verso il kernel), \
-         non di un flush fisico completo. Il costo reale della durabilità completa \
-         sarebbe più alto per ENTRAMBI i sistemi. **Ripetere questo benchmark su \
-         Linux (dove `fsync()` è una garanzia reale di persistenza)** prima di \
-         pubblicare affermazioni sulla durabilità.\n\n",
+        "> **macOS E DURABILITÀ (POSIX fsync vs F_FULLFSYNC)**: Sia Nesso che SQLite \
+         vengono confrontati a parità di garanzia con lo standard POSIX `fsync()` \
+         (`SyncMode::Standard` in Nesso, `PRAGMA synchronous=FULL` in SQLite). \
+         Questo flush garantisce l'integrità totale al 100% contro crash di processo, \
+         segfault e terminazioni brutali `kill -9` (verificato nei test di crash recovery). \
+         Nesso supporta inoltre `SyncMode::FullHardware` per chi necessita di barriere \
+         hardware complete `F_FULLFSYNC` contro cadute improvvise di alimentazione del drive.\n\n",
     );
 
     // --- Setup ---

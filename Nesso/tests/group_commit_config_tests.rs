@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nesso::server::AppState;
-use nesso::storage::engine::{Engine, GroupCommitConfig};
+use nesso::storage::engine::{Engine, GroupCommitConfig, SyncMode};
 
 fn temp_data_dir(test_name: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
@@ -24,12 +24,13 @@ fn test_default_group_commit_config() {
     let dir = temp_data_dir("default_cfg");
 
     // When passing None, Engine must use the default configuration:
-    // batch_window: 2ms, max_batch_size: 64, idle_commit_threshold: 250us
+    // batch_window: 2ms, max_batch_size: 64, idle_commit_threshold: 0, sync_mode: Standard
     let engine = Engine::open(&dir, None).unwrap();
     assert_eq!(engine.config(), GroupCommitConfig::default());
     assert_eq!(engine.config().batch_window, Duration::from_millis(2));
     assert_eq!(engine.config().max_batch_size, 64);
-    assert_eq!(engine.config().idle_commit_threshold, Duration::from_micros(250));
+    assert_eq!(engine.config().idle_commit_threshold, Duration::ZERO);
+    assert_eq!(engine.config().sync_mode, SyncMode::Standard);
 
     // AppState::new should also initialize with default config
     let state = AppState::new(dir.clone());
@@ -45,6 +46,7 @@ fn test_explicit_group_commit_config() {
         batch_window: Duration::from_millis(15),
         max_batch_size: 32,
         idle_commit_threshold: Duration::from_micros(500),
+        sync_mode: SyncMode::FullHardware,
     };
 
     let engine = Engine::open_with_config(&dir, custom_cfg).unwrap();
@@ -52,6 +54,7 @@ fn test_explicit_group_commit_config() {
     assert_eq!(engine.config().batch_window, Duration::from_millis(15));
     assert_eq!(engine.config().max_batch_size, 32);
     assert_eq!(engine.config().idle_commit_threshold, Duration::from_micros(500));
+    assert_eq!(engine.config().sync_mode, SyncMode::FullHardware);
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -72,6 +75,7 @@ fn test_single_thread_isolated_adaptive_latency() {
         batch_window: Duration::from_millis(15),
         max_batch_size: 64,
         idle_commit_threshold: Duration::from_millis(15),
+        sync_mode: SyncMode::Standard,
     };
     let engine_fixed = Engine::open_with_config(&dir_fixed, cfg_fixed).unwrap();
 
@@ -80,6 +84,7 @@ fn test_single_thread_isolated_adaptive_latency() {
         batch_window: Duration::from_millis(15),
         max_batch_size: 64,
         idle_commit_threshold: Duration::from_micros(250),
+        sync_mode: SyncMode::Standard,
     };
     let engine_adaptive = Engine::open_with_config(&dir_adaptive, cfg_adaptive).unwrap();
 
@@ -138,6 +143,7 @@ fn test_high_concurrency_batching_preservation() {
         batch_window: Duration::from_millis(20),
         max_batch_size: 64,
         idle_commit_threshold: Duration::from_micros(500),
+        sync_mode: SyncMode::Standard,
     };
     let engine = Arc::new(Engine::open_with_config(&dir, config).unwrap());
 
@@ -196,6 +202,7 @@ fn test_intermediate_staggered_arrivals_coalesced() {
         batch_window: Duration::from_millis(100),
         max_batch_size: 64,
         idle_commit_threshold: threshold,
+        sync_mode: SyncMode::Standard,
     };
     let engine = Arc::new(Engine::open_with_config(&dir, config).unwrap());
 
@@ -246,6 +253,7 @@ fn test_write_all_completed_before_group_commit_join() {
         batch_window: Duration::from_millis(10),
         max_batch_size: 64,
         idle_commit_threshold: Duration::from_micros(250),
+        sync_mode: SyncMode::Standard,
     };
     let engine = Arc::new(Engine::open_with_config(&dir, config).unwrap());
 
@@ -297,6 +305,7 @@ fn test_batching_behavior_comparison_by_window_and_batch_size() {
         batch_window: Duration::from_millis(50),
         max_batch_size: 64,
         idle_commit_threshold: Duration::from_millis(50),
+        sync_mode: SyncMode::Standard,
     };
     let engine_long = Arc::new(Engine::open_with_config(&dir_a, config_long).unwrap());
 
@@ -305,6 +314,7 @@ fn test_batching_behavior_comparison_by_window_and_batch_size() {
         batch_window: Duration::from_millis(1),
         max_batch_size: 64,
         idle_commit_threshold: Duration::from_micros(100),
+        sync_mode: SyncMode::Standard,
     };
     let engine_short = Arc::new(Engine::open_with_config(&dir_b, config_short).unwrap());
 
@@ -374,6 +384,7 @@ fn test_crash_recovery_with_custom_config() {
         batch_window: Duration::from_millis(5),
         max_batch_size: 16,
         idle_commit_threshold: Duration::from_micros(300),
+        sync_mode: SyncMode::Standard,
     };
 
     // Phase 1: Push tasks and acknowledge one with custom config
@@ -418,3 +429,61 @@ fn test_crash_recovery_with_custom_config() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_sync_mode_execution() {
+    // 1. Standard POSIX fsync mode
+    let dir_std = temp_data_dir("sync_mode_std");
+    let cfg_std = GroupCommitConfig {
+        batch_window: Duration::from_millis(5),
+        max_batch_size: 16,
+        idle_commit_threshold: Duration::ZERO,
+        sync_mode: SyncMode::Standard,
+    };
+    {
+        let engine = Engine::open_with_config(&dir_std, cfg_std).unwrap();
+        assert_eq!(engine.config().sync_mode, SyncMode::Standard);
+        for i in 0..5 {
+            engine.push(format!("std_task_{}", i).into_bytes(), 1).unwrap();
+        }
+        engine.sync().unwrap();
+    }
+    {
+        let recovered = Engine::open_with_config(&dir_std, cfg_std).unwrap();
+        let (ready, _) = recovered.status();
+        assert_eq!(ready, 5);
+        for i in 0..5 {
+            let (record, _) = recovered.pop_and_lease(1, 30).unwrap().unwrap();
+            assert_eq!(record.payload(), format!("std_task_{}", i).as_bytes());
+        }
+    }
+    let _ = fs::remove_dir_all(&dir_std);
+
+    // 2. Full hardware flush mode
+    let dir_full = temp_data_dir("sync_mode_full");
+    let cfg_full = GroupCommitConfig {
+        batch_window: Duration::from_millis(5),
+        max_batch_size: 16,
+        idle_commit_threshold: Duration::ZERO,
+        sync_mode: SyncMode::FullHardware,
+    };
+    {
+        let engine = Engine::open_with_config(&dir_full, cfg_full).unwrap();
+        assert_eq!(engine.config().sync_mode, SyncMode::FullHardware);
+        for i in 0..5 {
+            engine.push(format!("full_task_{}", i).into_bytes(), 1).unwrap();
+        }
+        engine.sync().unwrap();
+    }
+    {
+        let recovered = Engine::open_with_config(&dir_full, cfg_full).unwrap();
+        let (ready, _) = recovered.status();
+        assert_eq!(ready, 5);
+        for i in 0..5 {
+            let (record, _) = recovered.pop_and_lease(1, 30).unwrap().unwrap();
+            assert_eq!(record.payload(), format!("full_task_{}", i).as_bytes());
+        }
+    }
+    let _ = fs::remove_dir_all(&dir_full);
+}
+

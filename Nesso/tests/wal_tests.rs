@@ -71,3 +71,4 @@ fn test_iter_all_valid_records() {
         assert_eq!(rec.id(), i as u64);
     }
 }
+
