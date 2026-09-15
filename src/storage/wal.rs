@@ -4,7 +4,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::record::{Record, HEADER_SIZE, MAGIC_BYTE};
+use super::record::{Record, HEADER_SIZE, MAGIC_BYTE, MAX_PAYLOAD_SIZE};
 use super::group_commit::{perform_sync, SyncMode};
 
 pub const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
@@ -41,6 +41,16 @@ impl WalReader {
         cache.clear();
     }
 
+    pub fn cached_count(&self) -> usize {
+        let cache = self.read_cache.lock().unwrap();
+        cache.len()
+    }
+
+    pub fn cached_segments(&self) -> Vec<u64> {
+        let cache = self.read_cache.lock().unwrap();
+        cache.iter().map(|(id, _)| *id).collect()
+    }
+
     pub fn read_at(&self, segment_id: u64, offset: u64) -> io::Result<Option<Record>> {
         let mut cache = self.read_cache.lock().unwrap();
 
@@ -59,9 +69,14 @@ impl WalReader {
             &mut cache.last_mut().unwrap().1
         };
 
+        let file_len = file.metadata()?.len();
+        if offset + HEADER_SIZE as u64 > file_len {
+            return Ok(None);
+        }
+
         file.seek(SeekFrom::Start(offset))?;
 
-        let mut header = vec![0u8; HEADER_SIZE];
+        let mut header = [0u8; HEADER_SIZE];
         if let Err(e) = file.read_exact(&mut header) {
             if e.kind() == io::ErrorKind::UnexpectedEof { return Ok(None); }
             return Err(e);
@@ -72,6 +87,15 @@ impl WalReader {
         }
 
         let payload_len = extract_payload_len(&header);
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Payload length exceeds maximum bound"));
+        }
+
+        let frame_len = HEADER_SIZE as u64 + payload_len as u64;
+        if offset + frame_len > file_len {
+            return Ok(None);
+        }
+
         let mut payload = vec![0u8; payload_len];
 
         if let Err(e) = file.read_exact(&mut payload) {
@@ -103,6 +127,42 @@ impl Wal {
             fs::create_dir_all(dir)?;
         }
 
+        let temp_compacting = dir.join("nesso.00001.compacting");
+        let plan_path = dir.join("nesso.compaction_plan");
+        let swap_path = dir.join("nesso.compaction_swap");
+
+        // Handle crash recovery for compaction Phase 1 and Phase 2 windows
+        let active_plan = if plan_path.exists() {
+            Some(plan_path)
+        } else if swap_path.exists() {
+            Some(swap_path)
+        } else {
+            None
+        };
+
+        if let Some(plan_file) = active_plan {
+            if temp_compacting.exists() {
+                // Rename never occurred (Phase 1 crash or early Phase 2 crash).
+                // Original segments are intact. Discard partial compaction files.
+                let _ = fs::remove_file(&temp_compacting);
+                let _ = fs::remove_file(&plan_file);
+            } else {
+                // Atomic rename to nesso.00001.wal completed, but crashed before unlinking closed segments > 1.
+                // Complete the cleanup of obsolete closed segments.
+                if let Ok(content) = fs::read_to_string(&plan_file) {
+                    for seg_str in content.trim().split(',') {
+                        if let Ok(seg_id) = seg_str.trim().parse::<u64>() {
+                            if seg_id > 1 {
+                                let p = dir.join(format!("nesso.{:05}.wal", seg_id));
+                                let _ = fs::remove_file(p);
+                            }
+                        }
+                    }
+                }
+                let _ = fs::remove_file(&plan_file);
+            }
+        }
+
         let mut max_id = 0;
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -132,7 +192,66 @@ impl Wal {
             .append(true)
             .open(&active_path)?;
 
-        let current_size = active_file.seek(SeekFrom::End(0))?;
+        let raw_size = active_file.seek(SeekFrom::End(0))?;
+
+        // Scan active segment from offset 0 to find the last valid, checksum-verified record.
+        // If the active segment ends with a torn or partial frame (or bad magic byte, or corrupted payload length),
+        // truncate the active file to valid_offset (file.set_len(valid_offset)) so new writes append cleanly.
+        let mut valid_offset = 0u64;
+        active_file.seek(SeekFrom::Start(0))?;
+
+        loop {
+            if valid_offset == raw_size {
+                break;
+            }
+            if valid_offset + (HEADER_SIZE as u64) > raw_size {
+                // Incomplete header (< 19 bytes)
+                break;
+            }
+
+            let mut header = [0u8; HEADER_SIZE];
+            if let Err(_) = active_file.read_exact(&mut header) {
+                break;
+            }
+
+            if header[0] != MAGIC_BYTE {
+                break;
+            }
+
+            let payload_len = extract_payload_len(&header);
+            if payload_len > MAX_PAYLOAD_SIZE {
+                break;
+            }
+
+            let frame_len = HEADER_SIZE as u64 + payload_len as u64;
+            if valid_offset + frame_len > raw_size {
+                // Truncated payload
+                break;
+            }
+
+            let mut payload = vec![0u8; payload_len];
+            if let Err(_) = active_file.read_exact(&mut payload) {
+                break;
+            }
+
+            let mut full_record = Vec::with_capacity(HEADER_SIZE + payload_len);
+            full_record.extend_from_slice(&header);
+            full_record.extend_from_slice(&payload);
+
+            if Record::decode(&full_record).is_none() {
+                // CRC mismatch or invalid OpType
+                break;
+            }
+
+            valid_offset += frame_len;
+        }
+
+        if valid_offset < raw_size {
+            active_file.set_len(valid_offset)?;
+            perform_sync(&active_file, SyncMode::Standard)?;
+        }
+        active_file.seek(SeekFrom::End(0))?;
+        let current_size = valid_offset;
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -237,13 +356,20 @@ impl Wal {
     /// writes surviving records to atomic temporary file `nesso.00001.compacting`,
     /// and issues `sync_data()`. Can be executed without holding any locks.
     pub fn execute_compaction_phase1(dir: &Path, closed_segments: &[u64]) -> io::Result<(CompactionStats, HashMap<u64, u64>)> {
+        let mut created_payloads: HashMap<u64, Vec<u8>> = HashMap::new();
         let mut latest_records: HashMap<u64, Record> = HashMap::new();
 
         for &seg_id in closed_segments {
             let path = dir.join(format!("nesso.{:05}.wal", seg_id));
             let mut file = File::open(&path)?;
+            let file_len = file.metadata()?.len();
+            let mut current_offset = 0u64;
 
             loop {
+                if current_offset + (HEADER_SIZE as u64) > file_len {
+                    break;
+                }
+
                 let mut header = [0u8; HEADER_SIZE];
                 match file.read_exact(&mut header) {
                     Ok(()) => {}
@@ -256,23 +382,49 @@ impl Wal {
                 }
 
                 let payload_len = extract_payload_len(&header);
+                if payload_len > MAX_PAYLOAD_SIZE {
+                    break;
+                }
+
+                let frame_len = HEADER_SIZE as u64 + payload_len as u64;
+                if current_offset + frame_len > file_len {
+                    break;
+                }
+
                 let mut payload = vec![0u8; payload_len];
                 if let Err(e) = file.read_exact(&mut payload) {
                     if e.kind() == io::ErrorKind::UnexpectedEof { break; }
                     return Err(e);
                 }
 
+                current_offset += frame_len;
+
                 let mut full_record = Vec::with_capacity(HEADER_SIZE + payload_len);
                 full_record.extend_from_slice(&header);
                 full_record.extend_from_slice(&payload);
 
                 if let Some(record) = Record::decode(&full_record) {
+                    let id = record.id();
                     match record.op_type() {
                         super::record::OpType::Acked | super::record::OpType::DeadLettered => {
-                            latest_records.remove(&record.id());
+                            latest_records.remove(&id);
+                            created_payloads.remove(&id);
                         }
-                        _ => {
-                            latest_records.insert(record.id(), record);
+                        super::record::OpType::Created => {
+                            created_payloads.insert(id, record.payload().to_vec());
+                            latest_records.insert(id, record);
+                        }
+                        super::record::OpType::Leased => {
+                            if record.payload().len() >= 13 {
+                                created_payloads.entry(id).or_insert_with(|| record.payload()[13..].to_vec());
+                            }
+                            latest_records.insert(id, record);
+                        }
+                        super::record::OpType::Nacked | super::record::OpType::Expired => {
+                            if record.payload().len() >= 1 {
+                                created_payloads.entry(id).or_insert_with(|| record.payload()[1..].to_vec());
+                            }
+                            latest_records.insert(id, record);
                         }
                     }
                 }
@@ -295,7 +447,31 @@ impl Wal {
 
         for id in &surviving_ids {
             let record = &latest_records[id];
-            let bytes = record.encode();
+            let record_to_write = if record.op_type() == super::record::OpType::Created {
+                record.clone()
+            } else if let Some(orig_payload) = created_payloads.get(id) {
+                match record.op_type() {
+                    super::record::OpType::Leased => {
+                        let prefix_len = 13.min(record.payload().len());
+                        let mut consolidated = Vec::with_capacity(prefix_len + orig_payload.len());
+                        consolidated.extend_from_slice(&record.payload()[..prefix_len]);
+                        consolidated.extend_from_slice(orig_payload);
+                        Record::new(*id, record.op_type(), record.priority(), consolidated)
+                    }
+                    super::record::OpType::Nacked | super::record::OpType::Expired => {
+                        let retry_byte = record.payload().first().copied().unwrap_or(0);
+                        let mut consolidated = Vec::with_capacity(1 + orig_payload.len());
+                        consolidated.push(retry_byte);
+                        consolidated.extend_from_slice(orig_payload);
+                        Record::new(*id, record.op_type(), record.priority(), consolidated)
+                    }
+                    _ => record.clone(),
+                }
+            } else {
+                record.clone()
+            };
+
+            let bytes = record_to_write.encode();
             temp_file.write_all(&bytes)?;
             new_offsets.insert(*id, current_offset);
             current_offset += bytes.len() as u64;
@@ -303,6 +479,17 @@ impl Wal {
 
         perform_sync(&temp_file, SyncMode::Standard)?;
         drop(temp_file);
+
+        // Record compaction plan for Phase 2 crash resilience
+        let plan_path = dir.join("nesso.compaction_plan");
+        let plan_content = closed_segments.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+        let mut plan_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&plan_path)?;
+        plan_file.write_all(plan_content.as_bytes())?;
+        perform_sync(&plan_file, SyncMode::Standard)?;
 
         let stats = CompactionStats {
             closed_segments_compacted: closed_segments.len(),
@@ -316,6 +503,18 @@ impl Wal {
     /// Phase 2 (Atomic Swap): Atomically renames `nesso.00001.compacting` over `nesso.00001.wal`
     /// and unlinks obsolete closed segments. Must be executed under lock alongside in-memory index updates.
     pub fn execute_compaction_phase2(dir: &Path, closed_segments: &[u64]) -> io::Result<()> {
+        let plan_path = dir.join("nesso.compaction_plan");
+        if !plan_path.exists() {
+            let plan_content = closed_segments.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+            let mut plan_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&plan_path)?;
+            plan_file.write_all(plan_content.as_bytes())?;
+            perform_sync(&plan_file, SyncMode::Standard)?;
+        }
+
         let temp_path = dir.join("nesso.00001.compacting");
         let dest_path = dir.join("nesso.00001.wal");
         fs::rename(&temp_path, &dest_path)?;
@@ -326,6 +525,9 @@ impl Wal {
                 let _ = fs::remove_file(p);
             }
         }
+
+        let _ = fs::remove_file(&plan_path);
+        let _ = fs::remove_file(dir.join("nesso.compaction_swap"));
 
         Ok(())
     }
@@ -349,6 +551,10 @@ impl Wal {
             let path = entry.path();
             if path.is_file() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(".compacting") || name.ends_with(".tmp") {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
                     if let Some(id_str) = name.strip_prefix("nesso.").and_then(|s| s.strip_suffix(".wal")) {
                         if let Ok(id) = id_str.parse::<u64>() {
                             segment_ids.push(id);
@@ -400,9 +606,19 @@ impl Iterator for WalIteratorAll {
             }
 
             let file = self.current_file.as_mut().unwrap();
-            let mut header = [0u8; HEADER_SIZE];
-            let offset_in_segment = self.current_offset;
+            let file_len = match file.metadata() {
+                Ok(m) => m.len(),
+                Err(e) => return Some(Err(e)),
+            };
 
+            let offset_in_segment = self.current_offset;
+            if offset_in_segment + (HEADER_SIZE as u64) > file_len {
+                self.current_file = None;
+                self.current_segment_idx += 1;
+                continue;
+            }
+
+            let mut header = [0u8; HEADER_SIZE];
             match file.read_exact(&mut header) {
                 Ok(()) => {}
                 Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -420,6 +636,19 @@ impl Iterator for WalIteratorAll {
             }
 
             let payload_len = extract_payload_len(&header);
+            if payload_len > MAX_PAYLOAD_SIZE {
+                self.current_file = None;
+                self.current_segment_idx += 1;
+                continue;
+            }
+
+            let frame_len = HEADER_SIZE as u64 + payload_len as u64;
+            if offset_in_segment + frame_len > file_len {
+                self.current_file = None;
+                self.current_segment_idx += 1;
+                continue;
+            }
+
             let mut payload = vec![0u8; payload_len];
 
             if let Err(e) = file.read_exact(&mut payload) {
@@ -435,7 +664,7 @@ impl Iterator for WalIteratorAll {
             full_record.extend_from_slice(&header);
             full_record.extend_from_slice(&payload);
 
-            self.current_offset += HEADER_SIZE as u64 + payload_len as u64;
+            self.current_offset += frame_len;
 
             match Record::decode(&full_record) {
                 Some(record) => return Some(Ok((self.current_segment_id, offset_in_segment, record))),

@@ -245,8 +245,64 @@ impl Engine {
             Record::new(id, OpType::Created, priority, (*payload_arc).clone())
         } else {
             // Read-only I/O executed concurrently outside the lock as fallback
-            self.reader.read_at(data_seg, data_off)?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Record not found at offset"))?
+            let mut read_rec = None;
+            let mut cur_seg = data_seg;
+            let mut cur_off = data_off;
+
+            for retry in 0..3 {
+                match self.reader.read_at(cur_seg, cur_off) {
+                    Ok(Some(r)) => {
+                        read_rec = Some(r);
+                        break;
+                    }
+                    Ok(None) => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "Record not found at offset"));
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::NotFound && retry < 2 => {
+                        // File might have been compacted and unlinked during concurrent Phase 2!
+                        // Reacquire inner lock and check if data_index has moved to segment 1.
+                        let (new_seg, new_off) = {
+                            let state = self.inner.lock().unwrap();
+                            match state.data_index.get(&id).copied() {
+                                Some(loc) => loc,
+                                None => return Err(io::Error::new(io::ErrorKind::NotFound, "Missing data offset after compaction")),
+                            }
+                        };
+                        cur_seg = new_seg;
+                        cur_off = new_off;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            let raw_rec = match read_rec {
+                Some(r) => r,
+                None => return Err(io::Error::new(io::ErrorKind::NotFound, "Record not found after retry")),
+            };
+
+            // If the record on disk was consolidated during compaction (Leased, Nacked, Expired),
+            // extract the embedded user payload so the caller receives the original data.
+            let user_payload = match raw_rec.op_type() {
+                OpType::Created => raw_rec.payload().to_vec(),
+                OpType::Leased => {
+                    if raw_rec.payload().len() >= 13 {
+                        raw_rec.payload()[13..].to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                OpType::Nacked | OpType::Expired => {
+                    if raw_rec.payload().len() >= 1 {
+                        raw_rec.payload()[1..].to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => raw_rec.payload().to_vec(),
+            };
+
+            Record::new(id, OpType::Created, priority, user_payload)
         };
 
         Ok(Some((original_record, retries)))
@@ -504,6 +560,17 @@ impl Engine {
         state.payload_cache.stats()
     }
 
+    /// Clears the in-memory payload cache.
+    pub fn clear_payload_cache(&self) {
+        let mut state = self.inner.lock().unwrap();
+        state.payload_cache.clear();
+    }
+
+    /// Clears the WalReader open file descriptor cache.
+    pub fn clear_reader_cache(&self) {
+        self.reader.clear_cache();
+    }
+
     /// Complete shutdown of the Engine: forces group commit flush to disk,
     /// then stops and joins the background expiration worker.
     pub fn shutdown(&self) -> io::Result<()> {
@@ -546,15 +613,20 @@ impl EngineState {
             }
         }
 
-        let mut sorted_ids: Vec<u64> = self.index.keys().copied().collect();
-        sorted_ids.sort_unstable();
+        // Replay Pass 2 in exact log sequence order (segment_id, offset) of each task's latest event
+        // to guarantee bit-exact FIFO preservation across all states (unleased, leased, expired, nacked).
+        let mut entries: Vec<(u64, (u64, u64))> = self.index.iter().map(|(&id, &loc)| (id, loc)).collect();
+        entries.sort_by_key(|&(_, loc)| loc);
 
-        for id in sorted_ids {
-            let &(segment, offset) = match self.index.get(&id) {
-                Some(loc) => loc,
-                None => continue,
-            };
+        for (id, (segment, offset)) in entries {
             if let Some(record) = reader.read_at(segment, offset)? {
+                // If this task survived compaction as Leased, Nacked, or Expired,
+                // Pass 1 may not have encountered a Created record.
+                // Populate data_index so subsequent pops find the consolidated payload.
+                if !self.data_index.contains_key(&id) && (record.op_type() == OpType::Created || record.op_type() == OpType::Leased || record.op_type() == OpType::Nacked || record.op_type() == OpType::Expired) {
+                    self.data_index.insert(id, (segment, offset));
+                }
+
                 match record.op_type() {
                     OpType::Created | OpType::Nacked | OpType::Expired => {
                         let retries = if record.op_type() == OpType::Created {

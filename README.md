@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-87%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-124%20passed-brightgreen.svg)]()
 [![Safety](https://img.shields.io/badge/unsafe-0%25-success.svg)]()
 [![No Dependencies](https://img.shields.io/badge/storage%20core-0%20external%20deps-informational.svg)]()
 
@@ -223,7 +223,7 @@ fn main() -> std::io::Result<()> {
 # Build optimized release binaries
 cargo build --release
 
-# Run entire test suite (87 tests covering crash recovery, concurrency, and compactions)
+# Run entire test suite (124 tests covering crash recovery, concurrency, edge cases, and compactions)
 cargo test
 ```
 
@@ -285,22 +285,22 @@ All requests and responses use JSON. Payloads are Base64-encoded strings.
 
 ---
 
-## Verification & Test Coverage (87 Tests Passing)
+## Verification & Test Coverage (124 Tests Passing)
 
 Nesso includes an extensive test suite verifying failure resilience, memory safety, and concurrency:
 
-- **`compaction_tests.rs` (18 tests)**: Inode remapping, multi-segment global deduplication, active segment isolation, non-blocking concurrent writes, tombstone protection, multi-generation compaction cycles.
-- **`concurrency_tests.rs` (5 tests)**: Multi-producer multi-consumer chaos stress, mutex poison recovery, concurrent segment rotation, double-delivery prevention.
-- **`crash_recovery_test.rs` (2 tests)**: Out-of-process `kill -9` crash injection during active writes with cold reboot replay and CRC32 verification.
-- **`group_commit_config_tests.rs` (9 tests)**: Batch window/capacity customization, adaptive early commit, staggered arrival coalescing, `SyncMode::Standard` vs `SyncMode::FullHardware` durability execution.
-- **`http_workers_tests.rs` (2 tests)**: Deadlock-freedom verification with `--http-workers 1` under concurrent long-polling, pushes, and multi-queue loads.
-- **`payload_cache_tests.rs` (3 tests)**: In-memory cache hit validation, cold-read fallback after reboot, bounded eviction on terminal ACK/dead-letter.
-- **`priority_queue_integration_tests.rs` (2 tests)**: Strict priority dispatch ordering and concurrent MPMC scheduling across all 256 priority levels.
+- **`compaction_tests.rs` & `compaction_edge_cases_test.rs` (24 tests)**: Inode remapping, multi-segment global deduplication, active segment isolation, non-blocking concurrent writes, tombstone protection, multi-generation compaction cycles, and concurrent read/lease operations during Phase 1/Phase 2.
+- **`crash_recovery_test.rs` & `crash_recovery_edge_cases_test.rs` (10 tests)**: Out-of-process `kill -9` crash injection during active writes, partial `.compacting` cleanup, torn writes at segment boundaries, corrupted CRC32 bit flips, and cold reboot FIFO replay.
+- **`queue_boundary_and_churn_tests.rs` (13 tests)**: Priority 0 and 255 extremes, 64-bit hardware bitmap word transitions, burst traffic without sync, zero double-delivery, and lease concurrency.
+- **`adversarial_compaction_and_corruption_test.rs` (5 tests)**: High-concurrency segment rollover, closed segment corruption matrix, and byte-offset torn-write fuzzing.
+- **`adversarial_lease_and_queue_test.rs` (5 tests)**: Multi-threaded word boundary contention, TOCTOU lease expiration vs ACK races, and fuzzing oracle.
 - **`engine_tests.rs` (12 tests)**: Priority ordering, FIFO tie-breaking, lease expiration, retries and dead-letter queue bounds.
+- **`group_commit_config_tests.rs` (9 tests)**: Batch window/capacity customization, adaptive early commit, staggered arrival coalescing, `SyncMode::Standard` vs `SyncMode::FullHardware` durability execution.
+- **`wal_segmentation_tests.rs` & `wal_tests.rs` (12 tests)**: Rotation boundaries, cross-segment iteration, corrupted magic byte recovery.
+- **`record_tests.rs` (5 tests)**: Frame encoding, CRC32 checksum validation, random payload roundtrips.
+- **`server_tests.rs` & `http_workers_tests.rs` (8 tests)**: HTTP REST CRUD flow, long-polling timeout/wakeup, non-blocking compaction isolation, and worker thread concurrency.
 - **`shutdown_tests.rs` (4 tests)**: Graceful shutdown on SIGINT/SIGTERM, pending group-commit flush, long-polling 503 wakeup, worker thread join.
-- **`wal_segmentation_tests.rs` (8 tests)**: Rotation boundaries, cross-segment iteration, corrupted magic byte recovery.
-- **`record_tests.rs` & `wal_tests.rs` (9 tests)**: Frame encoding, CRC32 checksum validation, random payload roundtrips.
-- **`server_tests.rs` (6 tests)**: HTTP REST CRUD flow, long-polling timeout, wakeup on push/nack/expiration, non-blocking compaction isolation.
+- **`payload_cache_tests.rs` & `priority_queue_integration_tests.rs` (5 tests)**: Hot-path cache hit validation, cold-read fallback, bounded eviction on ACK, and MPMC priority scheduling.
 - **Storage Unit Tests (7 tests)**: Bitmap hardware bit-scan indexing, cache boundary eviction, and FIFO queues.
 
 ---

@@ -21,6 +21,7 @@ pub struct Record {
 pub const MAGIC_BYTE: u8 = 0x4E; // 'N'
 // Header size: Magic(1) + Checksum(4) + OpType(1) + Priority(1) + ID(8) + PayloadLen(4) = 19 bytes
 pub const HEADER_SIZE: usize = 19;
+pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024; // 64 MB
 
 impl Record {
     pub fn new(id: u64, op_type: OpType, priority: u8, payload: Vec<u8>) -> Self {
@@ -60,10 +61,24 @@ impl Record {
             return None;
         }
 
+        let payload_len = u32::from_be_bytes(data[15..19].try_into().unwrap()) as usize;
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return None;
+        }
+
+        let total_len = match HEADER_SIZE.checked_add(payload_len) {
+            Some(len) => len,
+            None => return None,
+        };
+
+        if data.len() < total_len {
+            return None;
+        }
+
         let expected_checksum = u32::from_be_bytes(data[1..5].try_into().unwrap());
         
         let mut hasher = Hasher::new();
-        hasher.update(&data[5..]);
+        hasher.update(&data[5..total_len]);
         if hasher.finalize() != expected_checksum {
             return None;
         }
@@ -80,13 +95,8 @@ impl Record {
 
         let priority = data[6];
         let id = u64::from_be_bytes(data[7..15].try_into().unwrap());
-        let payload_len = u32::from_be_bytes(data[15..19].try_into().unwrap()) as usize;
 
-        if data.len() < HEADER_SIZE + payload_len {
-            return None;
-        }
-
-        let payload = data[19..19 + payload_len].to_vec();
+        let payload = data[19..total_len].to_vec();
 
         Some(Self { id, op_type, priority, payload })
     }
